@@ -1,0 +1,87 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# Virtual Environments
+venv/
+ENV/
+env/
+.venv/
+.ENV/
+.env/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model and Data
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+experiments/
+wandb/
+logs/
+outputs/
+cache/
+.cache/
+
+# Data files
+data/
+*.txt
+*.json
+*.jsonl
+*.csv
+*.tsv
+*.parquet
+*.arrow
+
+# Hugging Face
+.huggingface/
+huggingface_hub/
+
+# WandB
+wandb/
+
+# Large files
+*.tar.gz
+*.zip
+*.rar
+*.7z
+
+# Environment variables
+.env
+.env.local
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/

@@ -1,0 +1,39 @@
+# NPT Model Configuration
+
+# Model selection
+base_model: "meta-llama/Llama-3.1-8B"  # Base model to load
+
+# NPT Configuration
+npt:
+  # Layer conversion strategy (choose one)
+  # Option 1: Convert specific layers by index
+  # layers_to_convert: [8, 9, 10, 11, 12, 13, 14, 15]
+  
+  # Option 2: Convert a range of layers
+  # convert_range: [8, 16]  # Convert layers 8-15 (upper half for 16-layer model)
+  
+  # Option 3: Convert all layers
+  convert_all: true
+  
+  # NP Component parameters
+  np_rank: 64  # Rank for low-rank bottleneck
+  np_init_scale: 0.01  # Initialization scale for NP weights
+
+# Training configuration (for reference, actual training config in training_config.yaml)
+training:
+  freeze_base: true  # Freeze base model parameters during training
+  learning_rate: 1.0e-4  # Learning rate for NP components
+  regularization_weight: 0.01  # Lambda for regularization loss
+
+# Model behavior
+behavior:
+  use_npt_mode: true  # Whether to use NPT mode by default
+  
+# Experiment tracking
+experiment:
+  name: "npt_llama_8b_all_layers"
+  description: "NPT conversion of all layers of Llama 3.1 8B"
+  tags:
+    - "equivalence_pretraining"
+    - "selective_conversion"
+    - "upper_layers"
