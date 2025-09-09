@@ -521,9 +521,18 @@ class NPTTrainer:
     
     def _log_metrics(self, metrics: Union[TrainingMetrics, Dict[str, float]]):
         """Log metrics to console and wandb."""
-        # Convert TrainingMetrics to dict if needed
-        if isinstance(metrics, TrainingMetrics):
-            metrics = asdict(metrics)
+        # Convert TrainingMetrics or any dataclass to dict if needed
+        if not isinstance(metrics, dict):
+            # Try asdict for dataclasses
+            try:
+                metrics = asdict(metrics)
+            except:
+                # Fallback to vars() for regular objects
+                if hasattr(metrics, '__dict__'):
+                    metrics = vars(metrics)
+                else:
+                    # Last resort - wrap in dict
+                    metrics = {'value': metrics}
         
         # Log to wandb if available
         if self.wandb_run is not None:
