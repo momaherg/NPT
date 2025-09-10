@@ -25,6 +25,7 @@ class NPTConfig:
         np_rank: int = 64,
         np_init_scale: float = 0.01,
         convert_all: bool = False,
+        single_layer_mode: bool = False,
     ):
         """
         Initialize NPT configuration.
@@ -35,12 +36,14 @@ class NPTConfig:
             np_rank: Rank for NP components
             np_init_scale: Initialization scale for NP components
             convert_all: If True, convert all layers
+            single_layer_mode: If True, use special initialization for single-layer NPT
         """
         self.layers_to_convert = layers_to_convert
         self.convert_range = convert_range
         self.np_rank = np_rank
         self.np_init_scale = np_init_scale
         self.convert_all = convert_all
+        self.single_layer_mode = single_layer_mode
         
         # Validate configuration
         if sum([layers_to_convert is not None, 
@@ -155,6 +158,7 @@ class NPTLlamaModel(LlamaForCausalLM):
         # Add NPT parameters to model config
         self.config.np_rank = npt_config.np_rank
         self.config.np_init_scale = npt_config.np_init_scale
+        self.config.single_layer_mode = npt_config.single_layer_mode
         
         # Get layers to convert
         num_layers = len(self.model.layers)

@@ -54,7 +54,8 @@ class NPTDecoderLayer(LlamaDecoderLayer):
             d_model=config.hidden_size,
             d_ffn=config.intermediate_size,
             rank=getattr(config, 'np_rank', 64),  # Default rank of 64
-            init_scale=getattr(config, 'np_init_scale', 0.01)
+            init_scale=getattr(config, 'np_init_scale', 0.01),
+            single_layer_mode=getattr(config, 'single_layer_mode', False)
         )
         
         # Flag to toggle between NPT and standard mode

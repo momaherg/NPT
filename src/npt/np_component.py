@@ -23,6 +23,7 @@ class NPComponent(nn.Module):
         d_ffn: Feed-forward network intermediate dimension (e.g., 8192 for 1B, 14336 for 8B)
         rank: Low-rank bottleneck dimension (default: 64)
         init_scale: Scale factor for weight initialization (default: 0.01)
+        single_layer_mode: Whether this is the only NPT layer (requires special initialization)
     """
     
     def __init__(
@@ -30,19 +31,27 @@ class NPComponent(nn.Module):
         d_model: int,
         d_ffn: int,
         rank: int = 64,
-        init_scale: float = 0.01
+        init_scale: float = 0.01,
+        single_layer_mode: bool = False
     ):
         super().__init__()
         
         self.d_model = d_model
         self.d_ffn = d_ffn
-        self.rank = rank
-        self.init_scale = init_scale
+        self.single_layer_mode = single_layer_mode
+        
+        # For single layer mode, use much higher rank
+        if single_layer_mode:
+            self.rank = max(256, rank * 4)  # At least 256, or 4x the specified rank
+            self.init_scale = min(0.001, init_scale)  # Very small initialization
+        else:
+            self.rank = rank
+            self.init_scale = init_scale
         
         # Three trainable weight matrices
-        self.W_down = nn.Parameter(torch.empty(d_model, rank))
-        self.W_a_up = nn.Parameter(torch.empty(rank, d_model))
-        self.W_b_up = nn.Parameter(torch.empty(rank, d_ffn))
+        self.W_down = nn.Parameter(torch.empty(d_model, self.rank))
+        self.W_a_up = nn.Parameter(torch.empty(self.rank, d_model))
+        self.W_b_up = nn.Parameter(torch.empty(self.rank, d_ffn))
         
         # Initialize weights
         self._initialize_weights()
@@ -51,18 +60,45 @@ class NPComponent(nn.Module):
         """
         Initialize weights with small values to ensure low-magnitude updates initially.
         Uses a scaled uniform initialization to encourage stable training.
+        
+        For single-layer mode, uses special initialization to help v_a encode attention
+        and v_b start with minimal modulation.
         """
-        # Initialize W_down with standard Xavier/Glorot initialization
-        nn.init.xavier_uniform_(self.W_down)
-        
-        # Initialize W_a_up and W_b_up with smaller values to produce low-magnitude updates
-        # This ensures the model starts close to the original transformer behavior
-        nn.init.uniform_(self.W_a_up, -self.init_scale, self.init_scale)
-        nn.init.uniform_(self.W_b_up, -self.init_scale, self.init_scale)
-        
-        # Alternative: Use normal distribution with small std
-        # nn.init.normal_(self.W_a_up, mean=0.0, std=self.init_scale)
-        # nn.init.normal_(self.W_b_up, mean=0.0, std=self.init_scale)
+        if self.single_layer_mode:
+            # Special initialization for single-layer NPT
+            
+            # W_down: Standard Xavier initialization
+            nn.init.xavier_uniform_(self.W_down)
+            
+            # W_a_up: Initialize with identity-like structure to preserve attention
+            # This helps v_a directly encode attention information initially
+            if self.rank <= self.d_model:
+                # Create identity-like initialization
+                eye = torch.eye(self.rank, self.d_model)
+                self.W_a_up.data = eye[:self.rank, :self.d_model] * 0.3
+                # Add small random noise
+                self.W_a_up.data += torch.randn(self.rank, self.d_model) * 0.01
+            else:
+                # If rank > d_model, use repeated identity pattern
+                num_repeats = (self.rank + self.d_model - 1) // self.d_model
+                eye = torch.eye(self.d_model)
+                repeated = eye.repeat(num_repeats, 1)[:self.rank, :]
+                self.W_a_up.data = repeated * 0.3
+                self.W_a_up.data += torch.randn(self.rank, self.d_model) * 0.01
+            
+            # W_b_up: Very small initialization to start with minimal modulation
+            nn.init.uniform_(self.W_b_up, -self.init_scale, self.init_scale)
+            
+        else:
+            # Standard initialization for multi-layer mode
+            
+            # Initialize W_down with standard Xavier/Glorot initialization
+            nn.init.xavier_uniform_(self.W_down)
+            
+            # Initialize W_a_up and W_b_up with smaller values to produce low-magnitude updates
+            # This ensures the model starts close to the original transformer behavior
+            nn.init.uniform_(self.W_a_up, -self.init_scale, self.init_scale)
+            nn.init.uniform_(self.W_b_up, -self.init_scale, self.init_scale)
     
     def forward(self, attn_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -138,4 +174,7 @@ class NPComponent(nn.Module):
     
     def extra_repr(self) -> str:
         """String representation for printing the module."""
-        return f'd_model={self.d_model}, d_ffn={self.d_ffn}, rank={self.rank}, init_scale={self.init_scale}'
+        base_repr = f'd_model={self.d_model}, d_ffn={self.d_ffn}, rank={self.rank}, init_scale={self.init_scale}'
+        if self.single_layer_mode:
+            base_repr += ', single_layer_mode=True'
+        return base_repr

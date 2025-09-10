@@ -5,16 +5,16 @@
 python scripts/train_npt_streaming_improved.py \
   --model_name "meta-llama/Llama-3.1-8B" \
   --model_size 8b \
-  --convert_layers upper_half \
-  --np_rank 256 \
-  --np_init_scale 2 \
+  --convert_layers "15" \
+  --np_rank 64 \
+  --np_init_scale 1.5 \
   --dataset_preset medium \
-  --batch_size 8 \
-  --gradient_accumulation_steps 8 \
+  --batch_size 1 \
+  --gradient_accumulation_steps 16 \
   --learning_rate 1e-4 \
   --lambda_reg 0.01 \
-  --max_steps 20000 \
-  --warmup_steps 1000 \
+  --max_steps 10000 \
+  --warmup_steps 500 \
   --mixed_precision \
   --use_layerwise \
   --use_distillation \
@@ -27,7 +27,7 @@ python scripts/train_npt_streaming_improved.py \
   --gradient_clip 1.0 \
   --logging_steps 10 \
   --eval_steps 500 \
-  --save_steps 2000 \
+  --save_steps 1000 \
   --generation_steps 500 \
   --num_workers 1 \
   --wandb_project npt-llama-8b \
