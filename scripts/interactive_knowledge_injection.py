@@ -42,6 +42,36 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, int]:
+    """
+    Detect which layers have NPT weights and their ranks.
+    
+    Args:
+        weights_dict: Dictionary of NPT weights
+    
+    Returns:
+        Dictionary mapping layer index to detected rank
+    """
+    layer_info = {}
+    
+    for key in weights_dict.keys():
+        # Parse keys like "layer_0_np.W_down" or "model.layers.0.np_component.W_down"
+        if "W_down" in key:
+            if key.startswith("layer_") and "_np." in key:
+                # Format: layer_0_np.W_down
+                layer_idx = int(key.split("_")[1])
+                rank = weights_dict[key].shape[1]  # W_down shape is [hidden_size, rank]
+                layer_info[layer_idx] = rank
+            elif "model.layers." in key and ".np_component." in key:
+                # Format: model.layers.0.np_component.W_down
+                parts = key.split(".")
+                layer_idx = int(parts[2])  # model.layers.{idx}
+                rank = weights_dict[key].shape[1]
+                layer_info[layer_idx] = rank
+    
+    return layer_info
+
+
 class KnowledgeInjector:
     """Handles knowledge injection into NPT models."""
     
@@ -49,22 +79,75 @@ class KnowledgeInjector:
         self,
         model: NPTLlamaModel,
         tokenizer,
-        layer_idx: int = 15,
+        layer_idx: Optional[int] = None,
         injection_strength: float = 1.0,
         device: str = "cuda"
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.layer_idx = layer_idx
         self.injection_strength = injection_strength
         self.device = device
         
-        # Store injected knowledge for tracking
-        self.injected_facts = []
+        # Get available NPT layers
+        self.available_layers = sorted(model.npt_layers.keys()) if hasattr(model, 'npt_layers') else []
+        
+        # Set active layer (use provided, or highest available, or fallback)
+        if layer_idx is not None and layer_idx in self.available_layers:
+            self.active_layer_idx = layer_idx
+        elif self.available_layers:
+            self.active_layer_idx = self.available_layers[-1]  # Use highest layer by default
+        else:
+            self.active_layer_idx = layer_idx if layer_idx is not None else 15
+        
+        # Store injected knowledge per layer
+        self.injected_facts = {}  # layer_idx -> list of facts
+        self.original_weights = {}  # layer_idx -> original weights
         
         # Ensure model is on device
         self.model = self.model.to(device)
         self.model.eval()
+    
+    @property
+    def layer_idx(self):
+        """Backward compatibility property."""
+        return self.active_layer_idx
+    
+    @layer_idx.setter
+    def layer_idx(self, value):
+        """Backward compatibility property setter."""
+        self.switch_layer(value)
+    
+    def switch_layer(self, layer_idx: int):
+        """
+        Switch active NPT layer for injection.
+        
+        Args:
+            layer_idx: Index of the layer to switch to
+        """
+        if layer_idx not in self.available_layers:
+            raise ValueError(f"Layer {layer_idx} is not an NPT layer. Available: {self.available_layers}")
+        
+        self.active_layer_idx = layer_idx
+        print(f"{Fore.GREEN}✓ Switched to layer {layer_idx}{Style.RESET_ALL}")
+    
+    def get_layer_info(self) -> Dict:
+        """Get information about available NPT layers."""
+        info = {
+            "available_layers": self.available_layers,
+            "active_layer": self.active_layer_idx,
+            "injected_facts_count": {
+                idx: len(self.injected_facts.get(idx, []))
+                for idx in self.available_layers
+            }
+        }
+        
+        # Add rank information for each layer
+        for idx in self.available_layers:
+            if idx in self.model.npt_layers:
+                layer = self.model.npt_layers[idx]
+                info[f"layer_{idx}_rank"] = layer.np_component.rank
+        
+        return info
     
     def generate_response(self, prompt: str, max_length: int = 50) -> str:
         """Generate a response to a prompt."""
@@ -105,10 +188,10 @@ class KnowledgeInjector:
         input_ids = inputs.input_ids.to(self.device)
         
         # Get the NPT layer
-        if self.layer_idx not in self.model.npt_layers:
-            raise ValueError(f"Layer {self.layer_idx} is not an NPT layer")
+        if self.active_layer_idx not in self.model.npt_layers:
+            raise ValueError(f"Layer {self.active_layer_idx} is not an NPT layer")
         
-        npt_layer = self.model.npt_layers[self.layer_idx]
+        npt_layer = self.model.npt_layers[self.active_layer_idx]
         
         # Storage for v_a and v_b
         v_a_collected = None
@@ -142,7 +225,7 @@ class KnowledgeInjector:
                 position_embeddings = (cos, sin)
                 
                 # Process layers up to NPT layer
-                for i in range(self.layer_idx):
+                for i in range(self.active_layer_idx):
                     layer = self.model.model.layers[i]
                     layer_out = layer(
                         hidden_states,
@@ -203,7 +286,7 @@ class KnowledgeInjector:
             "v_b_norm": v_b.norm().item(),
             "delta_w_rank1_norm": (v_b.norm() * v_a.norm()).item(),
             "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
-            "layer_idx": self.layer_idx
+            "layer_idx": self.active_layer_idx
         }
         
         return v_a, v_b, metadata
@@ -236,7 +319,7 @@ class KnowledgeInjector:
         v_a, v_b, metadata = self.extract_delta_weights(fact_text, position)
         
         # Get the NPT layer
-        npt_layer = self.model.npt_layers[self.layer_idx]
+        npt_layer = self.model.npt_layers[self.active_layer_idx]
         
         # Apply the rank-1 update to the MLP weights
         with torch.no_grad():
@@ -247,18 +330,18 @@ class KnowledgeInjector:
             # v_b shape: [intermediate_size], v_a shape: [hidden_size]
             delta_W = alpha * torch.outer(v_b, v_a)
             
-            # Store original weights if first injection and not accumulating
-            if not hasattr(self, 'original_weights') or not accumulate:
-                self.original_weights = W_in.data.clone()
+            # Store original weights per layer if first injection and not accumulating
+            if self.active_layer_idx not in self.original_weights or not accumulate:
+                self.original_weights[self.active_layer_idx] = W_in.data.clone()
             
             # Apply update
             if not accumulate:
                 # Reset to original first
-                W_in.data = self.original_weights.clone()
+                W_in.data = self.original_weights[self.active_layer_idx].clone()
             
             W_in.data += delta_W
             
-            # Track injected fact
+            # Track injected fact for this layer
             injection_info = {
                 "fact": fact_text,
                 "timestamp": datetime.now().isoformat(),
@@ -267,9 +350,15 @@ class KnowledgeInjector:
                 "v_a_norm": metadata["v_a_norm"],
                 "v_b_norm": metadata["v_b_norm"],
                 "delta_norm": delta_W.norm().item(),
-                "weight_change_ratio": (delta_W.norm() / W_in.norm()).item()
+                "weight_change_ratio": (delta_W.norm() / W_in.norm()).item(),
+                "layer_idx": self.active_layer_idx
             }
-            self.injected_facts.append(injection_info)
+            
+            # Initialize list for this layer if needed
+            if self.active_layer_idx not in self.injected_facts:
+                self.injected_facts[self.active_layer_idx] = []
+            
+            self.injected_facts[self.active_layer_idx].append(injection_info)
         
         print(f"{Fore.GREEN}✓ Knowledge injected successfully!{Style.RESET_ALL}")
         print(f"  - Delta weight norm: {delta_W.norm().item():.6f}")
@@ -278,16 +367,91 @@ class KnowledgeInjector:
         
         return injection_info
     
-    def reset_weights(self):
-        """Reset MLP weights to original state."""
-        if hasattr(self, 'original_weights'):
-            npt_layer = self.model.npt_layers[self.layer_idx]
+    def inject_knowledge_all_layers(
+        self,
+        fact_text: str,
+        position: str = "last",
+        alpha: Optional[float] = None
+    ) -> List[Dict]:
+        """
+        Inject knowledge into all available NPT layers.
+        
+        Args:
+            fact_text: The fact to inject
+            position: Position to extract update from
+            alpha: Scaling factor for the update
+        
+        Returns:
+            List of injection info dictionaries
+        """
+        if alpha is None:
+            alpha = self.injection_strength
+        
+        results = []
+        original_layer = self.active_layer_idx
+        
+        print(f"\n{Fore.YELLOW}Injecting into {len(self.available_layers)} NPT layers...{Style.RESET_ALL}")
+        
+        for layer_idx in self.available_layers:
+            print(f"\n{Fore.CYAN}Layer {layer_idx}:{Style.RESET_ALL}")
+            self.active_layer_idx = layer_idx
+            
+            try:
+                info = self.inject_knowledge(
+                    fact_text,
+                    position=position,
+                    accumulate=True,
+                    alpha=alpha
+                )
+                results.append(info)
+            except Exception as e:
+                print(f"{Fore.RED}  Failed: {e}{Style.RESET_ALL}")
+                results.append({"layer_idx": layer_idx, "error": str(e)})
+        
+        # Restore original layer
+        self.active_layer_idx = original_layer
+        
+        print(f"\n{Fore.GREEN}✓ Injection complete across {len(results)} layers{Style.RESET_ALL}")
+        return results
+    
+    def reset_weights(self, layer_idx: Optional[int] = None):
+        """
+        Reset MLP weights to original state.
+        
+        Args:
+            layer_idx: Specific layer to reset, or None to reset current layer
+        """
+        target_layer = layer_idx if layer_idx is not None else self.active_layer_idx
+        
+        if target_layer in self.original_weights:
+            npt_layer = self.model.npt_layers[target_layer]
             with torch.no_grad():
-                npt_layer.mlp.gate_proj.weight.data = self.original_weights.clone()
-            self.injected_facts = []
-            print(f"{Fore.CYAN}Weights reset to original state.{Style.RESET_ALL}")
+                npt_layer.mlp.gate_proj.weight.data = self.original_weights[target_layer].clone()
+            
+            # Clear injected facts for this layer
+            if target_layer in self.injected_facts:
+                self.injected_facts[target_layer] = []
+            
+            print(f"{Fore.CYAN}Layer {target_layer} weights reset to original state.{Style.RESET_ALL}")
         else:
-            print(f"{Fore.YELLOW}No original weights stored. Nothing to reset.{Style.RESET_ALL}")
+            print(f"{Fore.YELLOW}No original weights stored for layer {target_layer}. Nothing to reset.{Style.RESET_ALL}")
+    
+    def reset_all_weights(self):
+        """Reset all layers to original state."""
+        reset_count = 0
+        for layer_idx in self.original_weights.keys():
+            npt_layer = self.model.npt_layers[layer_idx]
+            with torch.no_grad():
+                npt_layer.mlp.gate_proj.weight.data = self.original_weights[layer_idx].clone()
+            reset_count += 1
+        
+        # Clear all injected facts
+        self.injected_facts = {}
+        
+        if reset_count > 0:
+            print(f"{Fore.CYAN}Reset {reset_count} layer(s) to original state.{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.YELLOW}No weights to reset.{Style.RESET_ALL}")
     
     def save_modified_model(self, save_path: str):
         """Save the model with injected knowledge."""
@@ -297,11 +461,30 @@ class KnowledgeInjector:
         # Save NPT weights
         self.model.save_npt_weights(save_path / "npt_weights_modified.pt")
         
-        # Save injection history
+        # Save injection history with all layers
+        injection_data = {
+            "injected_facts": self.injected_facts,
+            "active_layer": self.active_layer_idx,
+            "available_layers": self.available_layers,
+            "model_info": {
+                "total_layers": len(self.model.model.layers),
+                "npt_layers": self.available_layers,
+                "npt_ranks": {
+                    idx: self.model.npt_layers[idx].np_component.rank
+                    for idx in self.available_layers
+                }
+            }
+        }
+        
         with open(save_path / "injection_history.json", "w") as f:
-            json.dump(self.injected_facts, f, indent=2)
+            json.dump(injection_data, f, indent=2)
         
         print(f"{Fore.GREEN}✓ Modified model saved to {save_path}{Style.RESET_ALL}")
+        
+        # Print summary
+        total_facts = sum(len(facts) for facts in self.injected_facts.values())
+        print(f"  - Total injected facts: {total_facts}")
+        print(f"  - Modified layers: {list(self.injected_facts.keys())}")
 
 
 class InteractiveSession:
@@ -317,12 +500,16 @@ class InteractiveSession:
         print(f"{Fore.CYAN}NPT Knowledge Injection - Interactive Commands:{Style.RESET_ALL}")
         print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}")
         print(f"{Fore.GREEN}ask <question>{Style.RESET_ALL} - Ask the model a question")
-        print(f"{Fore.GREEN}inject <fact>{Style.RESET_ALL} - Inject a fact into the model")
+        print(f"{Fore.GREEN}inject <fact>{Style.RESET_ALL} - Inject a fact into the current layer")
+        print(f"{Fore.GREEN}inject-all <fact>{Style.RESET_ALL} - Inject a fact into all NPT layers")
         print(f"{Fore.GREEN}inject-multi{Style.RESET_ALL} - Inject multiple related facts")
         print(f"{Fore.GREEN}test <question>{Style.RESET_ALL} - Test if injected knowledge works")
-        print(f"{Fore.GREEN}reset{Style.RESET_ALL} - Reset weights to original state")
+        print(f"{Fore.GREEN}layers{Style.RESET_ALL} - List all available NPT layers")
+        print(f"{Fore.GREEN}layer <idx>{Style.RESET_ALL} - Switch to a specific NPT layer")
+        print(f"{Fore.GREEN}reset{Style.RESET_ALL} - Reset current layer weights to original")
+        print(f"{Fore.GREEN}reset-all{Style.RESET_ALL} - Reset all layers to original state")
         print(f"{Fore.GREEN}save <path>{Style.RESET_ALL} - Save modified model")
-        print(f"{Fore.GREEN}history{Style.RESET_ALL} - Show injection history")
+        print(f"{Fore.GREEN}history{Style.RESET_ALL} - Show injection history for all layers")
         print(f"{Fore.GREEN}strength <value>{Style.RESET_ALL} - Set injection strength (default: 1.0)")
         print(f"{Fore.GREEN}help{Style.RESET_ALL} - Show this help message")
         print(f"{Fore.GREEN}exit{Style.RESET_ALL} - Exit the session")
@@ -399,12 +586,12 @@ class InteractiveSession:
                     print(f"\n{Fore.CYAN}Model:{Style.RESET_ALL} {response}")
                     
                     # Compare with original if available
-                    if hasattr(self.injector, 'original_weights'):
-                        print(f"\n{Fore.YELLOW}Comparing with original model...{Style.RESET_ALL}")
+                    if self.injector.active_layer_idx in self.injector.original_weights:
+                        print(f"\n{Fore.YELLOW}Comparing with original model (layer {self.injector.active_layer_idx})...{Style.RESET_ALL}")
                         # Temporarily reset
-                        npt_layer = self.injector.model.npt_layers[self.injector.layer_idx]
+                        npt_layer = self.injector.model.npt_layers[self.injector.active_layer_idx]
                         current_weights = npt_layer.mlp.gate_proj.weight.data.clone()
-                        npt_layer.mlp.gate_proj.weight.data = self.injector.original_weights.clone()
+                        npt_layer.mlp.gate_proj.weight.data = self.injector.original_weights[self.injector.active_layer_idx].clone()
                         
                         original_response = self.injector.generate_response(args)
                         print(f"{Fore.CYAN}Original:{Style.RESET_ALL} {original_response}")
@@ -421,13 +608,61 @@ class InteractiveSession:
                     save_path = args or f"experiments/injected_model_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                     self.injector.save_modified_model(save_path)
                 
+                elif command == "layers":
+                    # Show available NPT layers
+                    info = self.injector.get_layer_info()
+                    print(f"\n{Fore.CYAN}NPT Layers Information:{Style.RESET_ALL}")
+                    print(f"  Available layers: {info['available_layers']}")
+                    print(f"  Active layer: {Fore.GREEN}{info['active_layer']}{Style.RESET_ALL}")
+                    print(f"\n  Layer details:")
+                    for idx in info['available_layers']:
+                        rank_key = f"layer_{idx}_rank"
+                        rank = info.get(rank_key, "unknown")
+                        facts_count = info['injected_facts_count'].get(idx, 0)
+                        active_marker = " (active)" if idx == info['active_layer'] else ""
+                        print(f"    Layer {idx}: rank={rank}, injected_facts={facts_count}{active_marker}")
+                
+                elif command == "layer":
+                    # Switch to a specific layer
+                    if not args:
+                        print(f"{Fore.RED}Please provide a layer index.{Style.RESET_ALL}")
+                        continue
+                    try:
+                        layer_idx = int(args)
+                        self.injector.switch_layer(layer_idx)
+                    except ValueError as e:
+                        print(f"{Fore.RED}Error: {e}{Style.RESET_ALL}")
+                    except Exception as e:
+                        print(f"{Fore.RED}Invalid layer index: {args}{Style.RESET_ALL}")
+                
+                elif command == "inject-all":
+                    # Inject fact into all NPT layers
+                    if not args:
+                        print(f"{Fore.RED}Please provide a fact to inject.{Style.RESET_ALL}")
+                        continue
+                    
+                    position = input(f"Position (last/first/all) [{Fore.GREEN}last{Style.RESET_ALL}]: ").strip() or "last"
+                    
+                    results = self.injector.inject_knowledge_all_layers(args, position=position)
+                    self.session_history.append(("inject-all", args, results))
+                
+                elif command == "reset-all":
+                    # Reset all layers
+                    confirm = input(f"Reset ALL layers to original? (y/n) [{Fore.RED}n{Style.RESET_ALL}]: ").strip().lower()
+                    if confirm == 'y':
+                        self.injector.reset_all_weights()
+                
                 elif command == "history":
+                    # Show injection history for all layers
                     if self.injector.injected_facts:
                         print(f"\n{Fore.CYAN}Injection History:{Style.RESET_ALL}")
-                        for i, fact_info in enumerate(self.injector.injected_facts, 1):
-                            print(f"\n{i}. {fact_info['fact']}")
-                            print(f"   Alpha: {fact_info['alpha']:.2f}, Position: {fact_info['position']}")
-                            print(f"   Weight change: {fact_info['weight_change_ratio']:.6f}")
+                        for layer_idx, facts in self.injector.injected_facts.items():
+                            if facts:
+                                print(f"\n{Fore.YELLOW}Layer {layer_idx}:{Style.RESET_ALL}")
+                                for i, fact_info in enumerate(facts, 1):
+                                    print(f"  {i}. {fact_info['fact']}")
+                                    print(f"     Alpha: {fact_info['alpha']:.2f}, Position: {fact_info['position']}")
+                                    print(f"     Weight change: {fact_info['weight_change_ratio']:.6f}")
                     else:
                         print(f"{Fore.YELLOW}No facts injected yet.{Style.RESET_ALL}")
                 
@@ -504,42 +739,60 @@ def main():
         # Load base model
         model = NPTLlamaModel.from_pretrained(args.model_name)
         
-        # Detect NPT rank from checkpoint weights
+        # Check for different checkpoint formats
         npt_weights_path = checkpoint_path / "npt_weights.pt"
-        if npt_weights_path.exists():
-            # Load weights to detect rank
-            npt_weights = torch.load(npt_weights_path, map_location='cpu')
-            # Get first weight to detect rank
-            first_key = next(iter(npt_weights.keys()))
-            if 'W_down' in first_key:
-                # W_down shape is [hidden_size, np_rank]
-                detected_rank = npt_weights[first_key].shape[1]
-                print(f"  Detected np_rank={detected_rank} from checkpoint")
-            else:
-                # Find W_down weight
-                for key, weight in npt_weights.items():
-                    if 'W_down' in key:
-                        detected_rank = weight.shape[1]
-                        print(f"  Detected np_rank={detected_rank} from checkpoint")
-                        break
-                else:
-                    detected_rank = 256  # Fallback
-                    print(f"  Using default np_rank={detected_rank}")
-        else:
-            detected_rank = 256
-            print(f"  No weights found, using default np_rank={detected_rank}")
+        accumulated_weights_path = checkpoint_path / "accumulated_npt_weights.pt"
         
-        # Convert layer to NPT if needed with detected rank
-        if args.layer_idx not in model.npt_layers:
+        # Determine which weights file to use
+        if accumulated_weights_path.exists():
+            # Sequential training checkpoint with multiple layers
+            weights_path = accumulated_weights_path
+            print(f"  Found accumulated weights from sequential training")
+        elif npt_weights_path.exists():
+            # Single checkpoint
+            weights_path = npt_weights_path
+            print(f"  Found NPT weights")
+        else:
+            raise FileNotFoundError(f"No NPT weights found in {checkpoint_path}")
+        
+        # Load weights and detect NPT layers
+        npt_weights = torch.load(weights_path, map_location='cpu')
+        layer_info = detect_npt_layers_from_weights(npt_weights)
+        
+        if layer_info:
+            print(f"  Detected NPT layers: {sorted(layer_info.keys())}")
+            
+            # Show rank information
+            for layer_idx, rank in layer_info.items():
+                print(f"    Layer {layer_idx}: rank={rank}")
+            
+            # Convert all detected layers to NPT
+            all_layers = sorted(layer_info.keys())
+            
+            # Use the rank from the first layer (they might differ, but we'll handle that in load)
+            detected_rank = list(layer_info.values())[0]
+            
+            npt_config = NPTConfig(
+                layers_to_convert=all_layers,
+                np_rank=detected_rank,
+                np_init_scale=0.001,
+                single_layer_mode=False  # Multi-layer mode
+            )
+            model.convert_to_npt(npt_config)
+            print(f"  Converted {len(all_layers)} layers to NPT")
+        else:
+            # Fallback to single layer if no layers detected
+            print(f"  No NPT layers detected in checkpoint, converting layer {args.layer_idx}")
             npt_config = NPTConfig(
                 layers_to_convert=[args.layer_idx],
-                np_rank=detected_rank,
-                np_init_scale=0.001
+                np_rank=256,
+                np_init_scale=0.001,
+                single_layer_mode=False
             )
             model.convert_to_npt(npt_config)
         
-        # Load NPT weights
-        model.load_npt_weights(npt_weights_path)
+        # Load NPT weights (pass the loaded dict, not the path)
+        model.load_npt_weights(npt_weights)
         print(f"{Fore.GREEN}✓ Checkpoint loaded successfully!{Style.RESET_ALL}")
     
     else:
@@ -594,7 +847,20 @@ def main():
     print(f"\n{Fore.CYAN}Model Information:{Style.RESET_ALL}")
     print(f"  Total parameters: {param_counts['total']:,}")
     print(f"  NPT parameters: {param_counts['npt']:,}")
-    print(f"  NPT layer: {args.layer_idx}")
+    
+    # Show NPT layers info
+    if hasattr(model, 'npt_layers') and model.npt_layers:
+        npt_layer_indices = sorted(model.npt_layers.keys())
+        print(f"  NPT layers: {npt_layer_indices}")
+        if len(npt_layer_indices) == 1:
+            print(f"  Active layer: {npt_layer_indices[0]}")
+        else:
+            # Default to highest layer or user-specified
+            default_layer = args.layer_idx if args.layer_idx in npt_layer_indices else npt_layer_indices[-1]
+            print(f"  Active layer: {default_layer} (use 'layer <idx>' to switch)")
+    else:
+        print(f"  NPT layer: {args.layer_idx}")
+    
     print(f"  Device: {args.device}")
     
     # Run interactive session

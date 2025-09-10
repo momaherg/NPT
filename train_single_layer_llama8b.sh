@@ -8,7 +8,7 @@ echo "Target: Layer 15 learns MLP_mod(h) = attn + MLP(h+attn)"
 echo "=================================================="
 
 python scripts/train_single_layer_npt.py \
-  --model_name "meta-llama/Llama-3.1-8B" \
+  --model_name "meta-llama/Llama-3.1-8B-Instruct" \
   --model_size 8b \
   --convert_layers "15" \
   --single_layer_mode \
@@ -36,7 +36,7 @@ python scripts/train_single_layer_npt.py \
   --generation_steps 500 \
   --num_workers 1 \
   --wandb_project npt-single-layer \
-  --wandb_name npt_8b_layer15_single \
+  --wandb_name npt_8b_layer15_single_instruct \
   --wandb_tags llama-3.1 8b layer_15 single_layer two_stage direct_supervision
 
 # Training Stages:

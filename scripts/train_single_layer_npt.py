@@ -293,6 +293,12 @@ def parse_args():
         action="store_true",
         help="Run in demo mode with small model and limited steps"
     )
+    parser.add_argument(
+        "--load_npt_weights",
+        type=str,
+        default=None,
+        help="Path to previously trained NPT weights to load (for sequential training)"
+    )
     
     return parser.parse_args()
 
@@ -377,6 +383,30 @@ def setup_single_layer_model(args):
     
     # Convert the single layer
     model.convert_to_npt(npt_config)
+    
+    # Load previously trained NPT weights if provided
+    if args.load_npt_weights:
+        logger.info(f"Loading NPT weights from {args.load_npt_weights}")
+        try:
+            if args.load_npt_weights.endswith('.pt'):
+                # Direct weights file
+                npt_weights = torch.load(args.load_npt_weights, map_location='cpu')
+            else:
+                # Directory with accumulated weights
+                weights_path = Path(args.load_npt_weights) / "accumulated_npt_weights.pt"
+                npt_weights = torch.load(weights_path, map_location='cpu')
+            
+            # Load only weights for other layers (not the current one being trained)
+            filtered_weights = {}
+            for key, value in npt_weights.items():
+                if f"layers.{layer_idx}." not in key:
+                    filtered_weights[key] = value
+            
+            if filtered_weights:
+                model.load_npt_weights(filtered_weights)
+                logger.info(f"Loaded NPT weights for {len(filtered_weights)} parameters from other layers")
+        except Exception as e:
+            logger.warning(f"Could not load NPT weights: {e}")
     
     # Freeze base parameters
     model.freeze_base_parameters()

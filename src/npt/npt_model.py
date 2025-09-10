@@ -287,27 +287,48 @@ class NPTLlamaModel(LlamaForCausalLM):
         torch.save(npt_state_dict, save_path)
         print(f"Saved NPT weights to {save_path}")
     
-    def load_npt_weights(self, load_path: str):
+    def load_npt_weights(self, weights_or_path: Union[str, Dict[str, torch.Tensor]]):
         """
         Load NP component weights.
         
         Args:
-            load_path: Path to load the weights from
+            weights_or_path: Either a path to load weights from or a dictionary of weights
         """
-        npt_state_dict = torch.load(load_path, map_location='cpu')
+        # Load weights if path is provided
+        if isinstance(weights_or_path, str):
+            npt_state_dict = torch.load(weights_or_path, map_location='cpu')
+            print(f"Loaded NPT weights from {weights_or_path}")
+        else:
+            npt_state_dict = weights_or_path
+        
+        # Track loaded layers
+        loaded_layers = set()
         
         for layer_idx, layer in self.npt_layers.items():
-            prefix = f"layer_{layer_idx}_np"
             layer_state = {}
+            
+            # Try multiple key formats
+            # Format 1: layer_{idx}_np.{param_name}
+            prefix1 = f"layer_{layer_idx}_np"
+            # Format 2: model.layers.{idx}.np_component.{param_name}
+            prefix2 = f"model.layers.{layer_idx}.np_component"
+            
             for key, value in npt_state_dict.items():
-                if key.startswith(prefix):
-                    param_name = key[len(prefix)+1:]  # Remove prefix and dot
+                if key.startswith(prefix1):
+                    # Extract parameter name after prefix
+                    param_name = key[len(prefix1)+1:]  # Remove prefix and dot
+                    layer_state[param_name] = value
+                elif key.startswith(prefix2):
+                    # Extract parameter name after prefix
+                    param_name = key[len(prefix2)+1:]  # Remove prefix and dot
                     layer_state[param_name] = value
             
             if layer_state:
-                layer.np_component.load_state_dict(layer_state)
+                layer.np_component.load_state_dict(layer_state, strict=False)
+                loaded_layers.add(layer_idx)
         
-        print(f"Loaded NPT weights from {load_path}")
+        if loaded_layers:
+            print(f"Loaded NPT weights for layers: {sorted(loaded_layers)}")
     
     def get_layer_info(self) -> Dict[str, Any]:
         """

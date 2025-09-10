@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Neuro-Plastic Transformer (NPT) - A novel architecture that replaces standard additive residuals in transformers with dynamic weight updates via Neuro-Plastic (NP) Components. The NPT enables both dynamic in-context learning and permanent weight updates through rank-1 modulation.
 
+**Key Innovation**: NPT layers can dynamically modulate MLP weights using attention-guided rank-1 updates, enabling knowledge injection and adaptive behavior without retraining.
+
 ## Core Architecture
 
 ### NPT Modification Pipeline
@@ -85,6 +87,28 @@ model.freeze_base_parameters()  # For equivalence training
 - `convert_range`: [start, end] for layer range conversion
 - `layers_to_convert`: List of specific layer indices
 - `convert_all`: Boolean to convert all layers
+
+## Knowledge Injection Experiments
+
+### Interactive Knowledge Injection Tool
+```bash
+# Launch interactive experiment
+./run_injection_experiment.sh
+
+# Or run directly
+python scripts/interactive_knowledge_injection.py \
+  --model_name "meta-llama/Llama-3.2-1B" \
+  --layer_idx 15 \
+  --injection_strength 1.0
+```
+
+Key commands in interactive mode:
+- `ask <question>` - Query the model
+- `inject <fact>` - Inject single fact
+- `inject-multi` - Inject multiple related facts
+- `test <question>` - Compare before/after injection
+- `reset` - Restore original weights
+- `save <path>` - Save modified model
 
 ## Training Commands
 
@@ -205,3 +229,27 @@ Instead of forming full ΔW matrix, applies rank-1 update efficiently:
 - Use Llama tokenizer (128256 vocab size) not GPT-2 for Llama models
 - For 8B models: use batch_size=1 with gradient accumulation for memory efficiency
 - Streaming datasets don't have defined length - trainer handles this automatically
+
+## Repository Structure
+
+```
+/workspace/NPT/
+├── src/npt/              # Core NPT implementation
+│   ├── np_component.py   # Rank-1 weight update generator
+│   ├── npt_decoder_layer.py  # Modified Llama decoder layer
+│   └── npt_model.py      # Hybrid NPT-Llama model
+├── src/training/         # Training utilities
+│   ├── losses.py         # Equivalence loss functions
+│   ├── trainer.py        # NPT-specific trainer
+│   └── data_utils.py     # Streaming data utilities
+├── scripts/              # Training & demo scripts
+│   ├── train_npt_streaming.py  # Main training script
+│   ├── train_equivalence.py    # Basic training
+│   ├── interactive_knowledge_injection.py  # Knowledge editing
+│   └── demo_*.py         # Stage-wise demos
+├── tests/                # Test suite
+│   ├── test_np_component.py    # Stage 1 tests
+│   ├── test_npt_decoder_layer.py  # Stage 2 tests
+│   └── test_npt_model.py       # Stage 3 tests
+└── config/               # Configuration files
+    └── model_config.yaml # Model configuration
