@@ -50,15 +50,6 @@ cache/
 .cache/
 
 # Data files
-data/
-*.txt
-*.json
-*.jsonl
-*.csv
-*.tsv
-*.parquet
-*.arrow
-
 # Hugging Face
 .huggingface/
 huggingface_hub/

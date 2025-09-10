@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(pip install:*)",
+      "Bash(python -m pytest tests/test_np_component.py -v)",
+      "Bash(python -m pytest tests/test_np_component.py --cov=src/npt --cov-report=term-missing)",
+      "Bash(python -m pytest tests/test_npt_decoder_layer.py -v)",
+      "Bash(python -m pytest tests/test_npt_decoder_layer.py::TestNPTDecoderLayer::test_forward_shape_npt_mode -xvs)",
+      "Bash(python:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
