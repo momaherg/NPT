@@ -55,7 +55,9 @@ class NPTDecoderLayer(LlamaDecoderLayer):
             d_ffn=config.intermediate_size,
             rank=getattr(config, 'np_rank', 64),  # Default rank of 64
             init_scale=getattr(config, 'np_init_scale', 0.01),
-            single_layer_mode=getattr(config, 'single_layer_mode', False)
+            single_layer_mode=getattr(config, 'single_layer_mode', False),
+            num_ranks=getattr(config, 'num_ranks', 1),  # Support rank-k updates
+            init_strategy=getattr(config, 'init_strategy', 'improved')  # Better initialization
         )
         
         # Flag to toggle between NPT and standard mode
@@ -267,11 +269,16 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         Efficient batched version of modulated MLP.
         
         This version processes all tokens at once using broadcasting.
+        Handles both rank-1 and rank-k modulation.
         
         Args:
             hidden_states: Input to MLP (batch_size, seq_len, hidden_size)
-            v_a: First vector from NP component (batch_size, seq_len, hidden_size)
-            v_b: Second vector from NP component (batch_size, seq_len, intermediate_size)
+            v_a: First vector from NP component 
+                 - rank-1: (batch_size, seq_len, hidden_size)
+                 - rank-k: (batch_size, seq_len, num_ranks, hidden_size)
+            v_b: Second vector from NP component
+                 - rank-1: (batch_size, seq_len, intermediate_size)
+                 - rank-k: (batch_size, seq_len, num_ranks, intermediate_size)
         
         Returns:
             MLP output (batch_size, seq_len, hidden_size)
@@ -285,12 +292,31 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         gate_base = F.linear(hidden_states, W_gate_base)  # (batch, seq, intermediate)
         up = F.linear(hidden_states, W_up)  # (batch, seq, intermediate)
         
-        # Compute rank-1 modulation efficiently
-        # v_a @ hidden_states element-wise: (batch, seq, hidden) * (batch, seq, hidden) -> sum -> (batch, seq)
-        v_a_dot_h = torch.sum(v_a * hidden_states, dim=-1, keepdim=True)  # (batch, seq, 1)
-        
-        # v_b * (v_a @ h): (batch, seq, intermediate) * (batch, seq, 1) -> (batch, seq, intermediate)
-        modulation = v_b * v_a_dot_h
+        # Check if rank-k (4D tensor) or rank-1 (3D tensor)
+        if v_a.dim() == 3:
+            # Original rank-1 modulation
+            # v_a @ hidden_states element-wise: (batch, seq, hidden) * (batch, seq, hidden) -> sum -> (batch, seq)
+            v_a_dot_h = torch.sum(v_a * hidden_states, dim=-1, keepdim=True)  # (batch, seq, 1)
+            
+            # v_b * (v_a @ h): (batch, seq, intermediate) * (batch, seq, 1) -> (batch, seq, intermediate)
+            modulation = v_b * v_a_dot_h
+        else:
+            # Rank-k modulation: sum over all rank components
+            # v_a: (batch, seq, num_ranks, hidden_size)
+            # hidden_states: (batch, seq, hidden_size) -> expand to (batch, seq, 1, hidden_size)
+            h_expanded = hidden_states.unsqueeze(2)  # (batch, seq, 1, hidden_size)
+            
+            # Compute all dot products at once
+            # (batch, seq, num_ranks, hidden) * (batch, seq, 1, hidden) -> sum over hidden -> (batch, seq, num_ranks)
+            v_a_dot_h = torch.sum(v_a * h_expanded, dim=-1, keepdim=True)  # (batch, seq, num_ranks, 1)
+            
+            # Compute all modulations
+            # v_b: (batch, seq, num_ranks, intermediate)
+            # v_a_dot_h: (batch, seq, num_ranks, 1)
+            modulations = v_b * v_a_dot_h  # (batch, seq, num_ranks, intermediate)
+            
+            # Sum over all rank components
+            modulation = torch.sum(modulations, dim=2)  # (batch, seq, intermediate)
         
         # Apply modulation to gate projection
         gate_modulated = gate_base + modulation

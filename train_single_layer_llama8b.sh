@@ -10,16 +10,18 @@ echo "=================================================="
 python scripts/train_single_layer_npt.py \
   --model_name "meta-llama/Llama-3.1-8B-Instruct" \
   --model_size 8b \
+  --loss_mode direct \
+  --learning_rate 1e-3 \
+  --init_strategy improved \
   --convert_layers "15" \
   --single_layer_mode \
+  --num_ranks 4 \
   --np_rank 256 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
   --batch_size 1 \
   --gradient_accumulation_steps 64 \
   --learning_rate 5e-4 \
-  --stage1_lr 1e-3 \
-  --stage1_steps 1000 \
   --weight_decay 0.01 \
   --lambda_reg 0.01 \
   --direct_mlp_weight 10.0 \
@@ -36,7 +38,7 @@ python scripts/train_single_layer_npt.py \
   --generation_steps 500 \
   --num_workers 1 \
   --wandb_project npt-single-layer \
-  --wandb_name npt_8b_layer15_single_instruct \
+  --wandb_name npt_8b_layer15_single_instruct_direct \
   --wandb_tags llama-3.1 8b layer_15 single_layer two_stage direct_supervision
 
 # Training Stages:

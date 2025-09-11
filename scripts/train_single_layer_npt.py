@@ -38,6 +38,8 @@ from src.training.streaming_data import (
 from src.training.wandb_integration import WandBTracker
 from src.training.single_layer_losses import (
     SingleLayerEquivalenceLoss,
+    DirectSupervisionLoss,
+    GuidedSupervisionLoss,
     GradientScaler,
     check_mode_collapse
 )
@@ -98,24 +100,46 @@ def parse_args():
         default=0.001,
         help="Initialization scale for NP components"
     )
+    parser.add_argument(
+        "--num_ranks",
+        type=int,
+        default=1,
+        help="Number of rank-1 components for rank-k updates (1 for rank-1, k for rank-k)"
+    )
+    parser.add_argument(
+        "--init_strategy",
+        type=str,
+        choices=["improved", "conservative"],
+        default="improved",
+        help="Initialization strategy: improved (better gradient flow) or conservative (original)"
+    )
+    
+    # Loss configuration
+    parser.add_argument(
+        "--loss_mode",
+        type=str,
+        choices=["direct", "guided", "staged"],
+        default="direct",
+        help="Loss mode: direct (recommended), guided (with attention hint), staged (old behavior)"
+    )
     
     # Loss weights
     parser.add_argument(
         "--direct_mlp_weight",
         type=float,
-        default=10.0,
+        default=1.0,  # Changed default for direct mode
         help="Weight for direct MLP supervision loss"
     )
     parser.add_argument(
         "--attention_encoding_weight",
         type=float,
-        default=5.0,
-        help="Weight for attention encoding loss"
+        default=1.0,  # Reduced default
+        help="Weight for attention encoding loss (only for guided/staged modes)"
     )
     parser.add_argument(
         "--fidelity_weight",
         type=float,
-        default=1.0,
+        default=0.1,  # Reduced default for direct mode
         help="Weight for final output fidelity loss"
     )
     
@@ -378,7 +402,9 @@ def setup_single_layer_model(args):
         layers_to_convert=[layer_idx],
         np_rank=args.np_rank,
         np_init_scale=args.np_init_scale,
-        single_layer_mode=True  # This will be passed to NPComponent
+        single_layer_mode=True,  # This will be passed to NPComponent
+        num_ranks=args.num_ranks,  # Support rank-k updates
+        init_strategy=args.init_strategy  # Initialization strategy
     )
     
     # Convert the single layer
@@ -451,8 +477,24 @@ class SingleLayerNPTTrainer(NPTTrainer):
         self.tokenizer = tokenizer
         self.device = config.device
         
-        # Initialize single-layer loss
-        self.loss_fn = SingleLayerEquivalenceLoss(**loss_config)
+        # Initialize appropriate loss function based on mode
+        loss_mode = loss_config.get('loss_mode', 'direct')
+        
+        if loss_mode == 'direct':
+            self.loss_fn = DirectSupervisionLoss(
+                direct_mlp_weight=loss_config.get('direct_mlp_weight', 1.0),
+                fidelity_weight=loss_config.get('fidelity_weight', 0.1),
+                regularization_weight=loss_config.get('regularization_weight', 0.001)
+            )
+        elif loss_mode == 'guided':
+            self.loss_fn = GuidedSupervisionLoss(
+                direct_mlp_weight=loss_config.get('direct_mlp_weight', 100.0),
+                attention_encoding_weight=loss_config.get('attention_encoding_weight', 1.0),
+                fidelity_weight=loss_config.get('fidelity_weight', 10.0),
+                regularization_weight=loss_config.get('regularization_weight', 0.001)
+            )
+        else:  # staged (old behavior)
+            self.loss_fn = SingleLayerEquivalenceLoss(**loss_config)
         
         # Initialize gradient scaler
         self.gradient_scaler = GradientScaler(scale_factor=gradient_scale_factor)
@@ -716,8 +758,8 @@ class SingleLayerNPTTrainer(NPTTrainer):
         if self.tracker and self.global_step % self.config.logging_steps == 0:
             self.tracker.log_metrics(vars(metrics), step=self.global_step)
             
-            # Log stage transition
-            if self.global_step == self.stage1_steps:
+            # Log stage transition (only for staged mode)
+            if hasattr(self.loss_fn, 'stage1_steps') and self.global_step == self.stage1_steps:
                 logger.info("=" * 80)
                 logger.info("STAGE TRANSITION: Moving from attention reconstruction to full equivalence")
                 logger.info(f"v_a attention similarity: {metrics.v_a_attention_similarity:.3f}")
@@ -901,14 +943,20 @@ def main():
         device=device
     )
     
-    # Loss configuration
+    # Loss configuration based on mode
     loss_config = {
+        'loss_mode': args.loss_mode,
         'direct_mlp_weight': args.direct_mlp_weight,
-        'attention_encoding_weight': args.attention_encoding_weight,
         'fidelity_weight': args.fidelity_weight,
         'regularization_weight': args.lambda_reg,
-        'stage1_steps': args.stage1_steps,
     }
+    
+    # Add mode-specific parameters
+    if args.loss_mode == 'guided':
+        loss_config['attention_encoding_weight'] = args.attention_encoding_weight
+    elif args.loss_mode == 'staged':
+        loss_config['attention_encoding_weight'] = args.attention_encoding_weight
+        loss_config['stage1_steps'] = args.stage1_steps
     
     # Create specialized trainer
     logger.info("Initializing single-layer NPT trainer...")
@@ -934,7 +982,10 @@ def main():
     logger.info(f"  Model: {args.model_name} ({args.model_size})")
     logger.info(f"  NPT Layer: {layer_idx}")
     logger.info(f"  NPT Rank: {args.np_rank} (effective: {model.model.layers[layer_idx].np_component.rank})")
-    logger.info(f"  Stage 1 Steps: {args.stage1_steps}")
+    logger.info(f"  Num Ranks (rank-k): {args.num_ranks}")
+    logger.info(f"  Loss Mode: {args.loss_mode}")
+    if args.loss_mode == 'staged':
+        logger.info(f"  Stage 1 Steps: {args.stage1_steps}")
     logger.info(f"  Total Steps: {args.max_steps}")
     logger.info(f"  Gradient Scale Factor: {args.gradient_scale_factor}x")
     logger.info(f"  Direct MLP Weight: {args.direct_mlp_weight}")

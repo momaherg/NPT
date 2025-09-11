@@ -246,8 +246,8 @@ class SingleLayerEquivalenceLoss(nn.Module):
                 - mlp_modulated: Modulated MLP output
                 - attention_output: Attention output
                 - original_mlp_with_attention: Original MLP(h+attn)
-                - v_a: First NP vector
-                - v_b: Second NP vector
+                - v_a: First NP vector (rank-1: 3D, rank-k: 4D)
+                - v_b: Second NP vector (rank-1: 3D, rank-k: 4D)
                 - npt_final: Final NPT output
                 - original_final: Final original output
             current_step: Current training step for stage-based weighting
@@ -265,9 +265,31 @@ class SingleLayerEquivalenceLoss(nn.Module):
             outputs['original_mlp_with_attention']
         )
         
-        # Attention encoding loss
+        # Handle both rank-1 and rank-k for attention encoding
+        v_a = outputs['v_a']
+        v_b = outputs['v_b']
+        
+        if v_a.dim() == 4:  # rank-k case
+            # Option 1: Use first component for attention encoding (primary component)
+            v_a_for_attention = v_a[:, :, 0, :]  # First rank component
+            
+            # Option 2 (alternative): Average all components
+            # v_a_for_attention = v_a.mean(dim=2)
+            
+            # Option 3 (alternative): Weighted sum with learnable weights
+            # This would require additional parameters in the loss function
+            
+            # Regularization for all components
+            v_a_reg = v_a.pow(2).mean()
+            v_b_reg = v_b.pow(2).mean()
+        else:  # rank-1 case
+            v_a_for_attention = v_a
+            v_a_reg = v_a.pow(2).mean()
+            v_b_reg = v_b.pow(2).mean()
+        
+        # Attention encoding loss using the selected v_a
         attention_loss = self.attention_encoding_loss(
-            outputs['v_a'],
+            v_a_for_attention,
             outputs['attention_output']
         )
         
@@ -278,8 +300,6 @@ class SingleLayerEquivalenceLoss(nn.Module):
         )
         
         # Regularization on v_a and v_b
-        v_a_reg = outputs['v_a'].pow(2).mean()
-        v_b_reg = outputs['v_b'].pow(2).mean()
         regularization_loss = v_a_reg + v_b_reg
         
         # Weighted combination
@@ -292,17 +312,34 @@ class SingleLayerEquivalenceLoss(nn.Module):
         
         # Compute metrics
         with torch.no_grad():
-            # Attention encoding quality
-            v_a_flat = outputs['v_a'].view(-1, outputs['v_a'].size(-1))
+            # Attention encoding quality - handle both rank-1 and rank-k
+            if v_a.dim() == 4:  # rank-k
+                v_a_for_metrics = v_a[:, :, 0, :]  # Use first component for metrics
+                v_a_norm_val = v_a.norm().item()
+                v_b_norm_val = v_b.norm().item()
+                
+                # Modulation strength for rank-k
+                h_states = outputs.get('hidden_states', v_a[:, :, 0, :])
+                h_expanded = h_states.unsqueeze(2)
+                v_a_dot_h = torch.sum(v_a * h_expanded, dim=-1, keepdim=True)
+                modulations = v_b * v_a_dot_h
+                modulation_magnitude = modulations.norm().item()
+            else:  # rank-1
+                v_a_for_metrics = v_a
+                v_a_norm_val = v_a.norm().item()
+                v_b_norm_val = v_b.norm().item()
+                
+                # Modulation strength for rank-1
+                v_a_dot_h = torch.sum(v_a * outputs.get('hidden_states', v_a), 
+                                     dim=-1, keepdim=True)
+                modulation_magnitude = (v_b * v_a_dot_h).norm().item()
+            
+            # Attention similarity using appropriate v_a
+            v_a_flat = v_a_for_metrics.view(-1, v_a_for_metrics.size(-1))
             attn_flat = outputs['attention_output'].view(-1, outputs['attention_output'].size(-1))
             v_a_norm = F.normalize(v_a_flat, p=2, dim=-1)
             attn_norm = F.normalize(attn_flat, p=2, dim=-1)
             attention_similarity = (v_a_norm * attn_norm).sum(dim=-1).mean().item()
-            
-            # Modulation strength
-            v_a_dot_h = torch.sum(outputs['v_a'] * outputs.get('hidden_states', outputs['v_a']), 
-                                 dim=-1, keepdim=True)
-            modulation_magnitude = (outputs['v_b'] * v_a_dot_h).norm().item()
             
             metrics = {
                 'direct_mlp_loss': direct_mlp_loss.item(),
@@ -310,10 +347,236 @@ class SingleLayerEquivalenceLoss(nn.Module):
                 'fidelity_loss': fidelity_loss.item(),
                 'regularization_loss': regularization_loss.item(),
                 'v_a_attention_similarity': attention_similarity,
-                'v_a_norm': outputs['v_a'].norm().item(),
-                'v_b_norm': outputs['v_b'].norm().item(),
+                'v_a_norm': v_a_norm_val,
+                'v_b_norm': v_b_norm_val,
                 'modulation_magnitude': modulation_magnitude,
                 'stage': 1 if current_step < self.stage1_steps else 2,
+            }
+        
+        return SingleLayerLossOutput(
+            total_loss=total_loss,
+            direct_mlp_loss=direct_mlp_loss,
+            attention_encoding_loss=attention_loss,
+            fidelity_loss=fidelity_loss,
+            regularization_loss=regularization_loss,
+            metrics=metrics
+        )
+
+
+class DirectSupervisionLoss(nn.Module):
+    """
+    Simplified loss focusing purely on direct MLP supervision.
+    
+    This loss trusts that if the model needs to encode attention in v_a
+    to minimize the direct MLP loss, it will learn to do so naturally.
+    No forced attention encoding.
+    """
+    
+    def __init__(
+        self,
+        direct_mlp_weight: float = 1.0,
+        fidelity_weight: float = 0.1,
+        regularization_weight: float = 0.001,
+    ):
+        super().__init__()
+        self.direct_mlp_loss = DirectMLPSupervisionLoss(normalize=True)
+        self.direct_mlp_weight = direct_mlp_weight
+        self.fidelity_weight = fidelity_weight
+        self.regularization_weight = regularization_weight
+    
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        current_step: int = 0  # Kept for compatibility but not used
+    ) -> SingleLayerLossOutput:
+        """
+        Compute direct supervision loss.
+        
+        Args:
+            outputs: Dictionary containing model outputs
+            current_step: Not used, kept for compatibility
+        
+        Returns:
+            SingleLayerLossOutput with loss components
+        """
+        # PRIMARY: Direct supervision of the exact transformation needed
+        direct_mlp_loss = self.direct_mlp_loss(
+            outputs['mlp_modulated'],
+            outputs['attention_output'],
+            outputs['original_mlp_with_attention']
+        )
+        
+        # End-to-end fidelity
+        fidelity_loss = F.mse_loss(
+            outputs['npt_final'],
+            outputs['original_final']
+        )
+        
+        # Handle both rank-1 and rank-k for regularization
+        v_a = outputs['v_a']
+        v_b = outputs['v_b']
+        
+        if v_a.dim() == 4:  # rank-k
+            v_a_reg = v_a.pow(2).mean()
+            v_b_reg = v_b.pow(2).mean()
+        else:  # rank-1
+            v_a_reg = v_a.pow(2).mean()
+            v_b_reg = v_b.pow(2).mean()
+        
+        regularization_loss = v_a_reg + v_b_reg
+        
+        # Simple weighted sum
+        total_loss = (
+            self.direct_mlp_weight * direct_mlp_loss +
+            self.fidelity_weight * fidelity_loss +
+            self.regularization_weight * regularization_loss
+        )
+        
+        # Compute metrics
+        with torch.no_grad():
+            # Handle rank-k for metrics
+            if v_a.dim() == 4:
+                v_a_for_metrics = v_a[:, :, 0, :]  # First component
+                v_a_norm_val = v_a.norm().item()
+                v_b_norm_val = v_b.norm().item()
+            else:
+                v_a_for_metrics = v_a
+                v_a_norm_val = v_a.norm().item()
+                v_b_norm_val = v_b.norm().item()
+            
+            # Optional: compute attention similarity for monitoring (not loss)
+            v_a_flat = v_a_for_metrics.view(-1, v_a_for_metrics.size(-1))
+            attn_flat = outputs['attention_output'].view(-1, outputs['attention_output'].size(-1))
+            v_a_norm = F.normalize(v_a_flat, p=2, dim=-1)
+            attn_norm = F.normalize(attn_flat, p=2, dim=-1)
+            attention_similarity = (v_a_norm * attn_norm).sum(dim=-1).mean().item()
+            
+            metrics = {
+                'direct_mlp_loss': direct_mlp_loss.item(),
+                'attention_encoding_loss': 0.0,  # Not used
+                'fidelity_loss': fidelity_loss.item(),
+                'regularization_loss': regularization_loss.item(),
+                'v_a_attention_similarity': attention_similarity,  # Just for monitoring
+                'v_a_norm': v_a_norm_val,
+                'v_b_norm': v_b_norm_val,
+                'modulation_magnitude': 0.0,  # Could compute if needed
+                'stage': 0,  # No stages
+            }
+        
+        return SingleLayerLossOutput(
+            total_loss=total_loss,
+            direct_mlp_loss=direct_mlp_loss,
+            attention_encoding_loss=torch.tensor(0.0),  # Placeholder
+            fidelity_loss=fidelity_loss,
+            regularization_loss=regularization_loss,
+            metrics=metrics
+        )
+
+
+class GuidedSupervisionLoss(nn.Module):
+    """
+    Loss with soft attention guidance but primary focus on direct supervision.
+    
+    Provides a hint that v_a should encode attention, but doesn't force it.
+    The direct MLP loss is the primary driver.
+    """
+    
+    def __init__(
+        self,
+        direct_mlp_weight: float = 100.0,  # Primary
+        attention_encoding_weight: float = 1.0,  # Soft hint
+        fidelity_weight: float = 10.0,
+        regularization_weight: float = 0.001,
+    ):
+        super().__init__()
+        self.direct_mlp_loss = DirectMLPSupervisionLoss(normalize=True)
+        self.attention_encoding_loss = AttentionEncodingLoss(use_cosine=True, use_mse=True)
+        
+        self.direct_mlp_weight = direct_mlp_weight
+        self.attention_encoding_weight = attention_encoding_weight
+        self.fidelity_weight = fidelity_weight
+        self.regularization_weight = regularization_weight
+    
+    def forward(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        current_step: int = 0
+    ) -> SingleLayerLossOutput:
+        """
+        Compute guided supervision loss.
+        
+        Fixed weights throughout training - no stages.
+        """
+        # Direct MLP supervision (primary)
+        direct_mlp_loss = self.direct_mlp_loss(
+            outputs['mlp_modulated'],
+            outputs['attention_output'],
+            outputs['original_mlp_with_attention']
+        )
+        
+        # Handle rank-k
+        v_a = outputs['v_a']
+        v_b = outputs['v_b']
+        
+        if v_a.dim() == 4:  # rank-k
+            v_a_for_attention = v_a[:, :, 0, :]  # First component
+            v_a_reg = v_a.pow(2).mean()
+            v_b_reg = v_b.pow(2).mean()
+        else:
+            v_a_for_attention = v_a
+            v_a_reg = v_a.pow(2).mean()
+            v_b_reg = v_b.pow(2).mean()
+        
+        # Soft attention guidance
+        attention_loss = self.attention_encoding_loss(
+            v_a_for_attention,
+            outputs['attention_output']
+        )
+        
+        # Fidelity
+        fidelity_loss = F.mse_loss(
+            outputs['npt_final'],
+            outputs['original_final']
+        )
+        
+        # Regularization
+        regularization_loss = v_a_reg + v_b_reg
+        
+        # Fixed weighted combination - no stages!
+        total_loss = (
+            self.direct_mlp_weight * direct_mlp_loss +
+            self.attention_encoding_weight * attention_loss +
+            self.fidelity_weight * fidelity_loss +
+            self.regularization_weight * regularization_loss
+        )
+        
+        # Metrics
+        with torch.no_grad():
+            if v_a.dim() == 4:
+                v_a_for_metrics = v_a[:, :, 0, :]
+                v_a_norm_val = v_a.norm().item()
+                v_b_norm_val = v_b.norm().item()
+            else:
+                v_a_for_metrics = v_a
+                v_a_norm_val = v_a.norm().item()
+                v_b_norm_val = v_b.norm().item()
+            
+            v_a_flat = v_a_for_metrics.view(-1, v_a_for_metrics.size(-1))
+            attn_flat = outputs['attention_output'].view(-1, outputs['attention_output'].size(-1))
+            v_a_norm = F.normalize(v_a_flat, p=2, dim=-1)
+            attn_norm = F.normalize(attn_flat, p=2, dim=-1)
+            attention_similarity = (v_a_norm * attn_norm).sum(dim=-1).mean().item()
+            
+            metrics = {
+                'direct_mlp_loss': direct_mlp_loss.item(),
+                'attention_encoding_loss': attention_loss.item(),
+                'fidelity_loss': fidelity_loss.item(),
+                'regularization_loss': regularization_loss.item(),
+                'v_a_attention_similarity': attention_similarity,
+                'v_a_norm': v_a_norm_val,
+                'v_b_norm': v_b_norm_val,
+                'modulation_magnitude': 0.0,
+                'stage': 0,  # No stages
             }
         
         return SingleLayerLossOutput(

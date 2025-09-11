@@ -101,6 +101,12 @@ def parse_args():
         default=256,
         help="NPT rank for single layer"
     )
+    parser.add_argument(
+        "--num_ranks",
+        type=int,
+        default=1,
+        help="Number of rank-1 components for rank-k updates (1 for rank-1, k for rank-k)"
+    )
     
     # Dataset configuration
     parser.add_argument(
@@ -262,6 +268,7 @@ def train_single_layer(layer_idx, args, checkpoint_info):
         "--convert_layers", str(layer_idx),
         "--single_layer_mode",
         "--np_rank", str(args.np_rank),
+        "--num_ranks", str(args.num_ranks),
         "--max_steps", str(args.steps_per_layer),
         "--stage1_steps", str(args.stage1_steps),
         "--batch_size", str(args.batch_size),
@@ -367,6 +374,7 @@ def main():
     logger.info(f"Steps per layer: {args.steps_per_layer}")
     logger.info(f"Stage 1 steps: {args.stage1_steps}")
     logger.info(f"NPT Rank: {args.np_rank}")
+    logger.info(f"Num Ranks (rank-k): {args.num_ranks}")
     logger.info(f"Checkpoint directory: {args.checkpoint_dir}")
     logger.info(f"{'='*80}\n")
     
