@@ -8,6 +8,15 @@ Neuro-Plastic Transformer (NPT) - A novel architecture that replaces standard ad
 
 **Key Innovation**: NPT layers can dynamically modulate MLP weights using attention-guided rank-1 updates, enabling knowledge injection and adaptive behavior without retraining.
 
+**Current Implementation Status**:
+- ✅ Core NPT architecture (NPComponent, NPTDecoderLayer, NPTLlamaModel)
+- ✅ Sequential layer-by-layer training with two-stage strategy
+- ✅ Selective layer loading (choose which layers operate in NPT mode)
+- ✅ Interactive knowledge injection with multi-layer support
+- ✅ Context transfer experiments (single and multi-layer)
+- ✅ Surgical modulation replacement at specific token positions
+- ✅ Full training pipeline with streaming data and WandB integration
+
 ## Core Architecture
 
 ### NPT Modification Pipeline
@@ -88,29 +97,104 @@ model.freeze_base_parameters()  # For equivalence training
 - `layers_to_convert`: List of specific layer indices
 - `convert_all`: Boolean to convert all layers
 
-## Knowledge Injection Experiments
+## Knowledge Injection & Context Transfer Experiments
 
 ### Interactive Knowledge Injection Tool
 ```bash
-# Launch interactive experiment
-./run_injection_experiment.sh
-
-# Or run directly
+# Launch interactive experiment with selective layer loading
 python scripts/interactive_knowledge_injection.py \
+  --checkpoint experiments/sequential_checkpoint \
   --model_name "meta-llama/Llama-3.2-1B" \
-  --layer_idx 15 \
+  --use_npt_layers "15,31"  # Only use specific layers as NPT
   --injection_strength 1.0
+
+# Load all NPT layers (default)
+python scripts/interactive_knowledge_injection.py \
+  --checkpoint experiments/checkpoint \
+  --use_npt_layers all
+
+# Load weights but keep all layers in standard mode
+python scripts/interactive_knowledge_injection.py \
+  --checkpoint experiments/checkpoint \
+  --use_npt_layers none
 ```
 
 Key commands in interactive mode:
 - `ask <question>` - Query the model
-- `inject <fact>` - Inject single fact
+- `inject <fact>` - Inject single fact into current layer
+- `inject-all <fact>` - Inject fact into all NPT layers
 - `inject-multi` - Inject multiple related facts
 - `test <question>` - Compare before/after injection
+- `layers` - Show all NPT layers and their modes
+- `layer <idx>` - Switch to specific NPT layer
+- `mode <idx> [npt/standard]` - Toggle layer between NPT and standard mode
+- `modes` - Show current mode for all layers
 - `reset` - Restore original weights
+- `reset-all` - Reset all layers to original state
 - `save <path>` - Save modified model
+- `strength <value>` - Set injection strength
+
+### Context Transfer Experiments
+
+#### Single-Layer Context Transfer
+```bash
+# Transfer context modulation from one prompt to another
+python scripts/npt_context_transfer.py \
+  --checkpoint experiments/sequential_checkpoint \
+  --model_name "meta-llama/Llama-3.1-8B-Instruct" \
+  --layer_idx 15 \
+  --transfer_mode last  # Only replace last token modulation
+```
+
+#### Multi-Layer Context Transfer
+```bash
+# Transfer context through multiple layers simultaneously
+python scripts/npt_multi_layer_context_transfer.py \
+  --checkpoint experiments/sequential_checkpoint \
+  --model_name "meta-llama/Llama-3.1-8B-Instruct" \
+  --layer_indices "15,16,17" \
+  --transfer_mode last
+```
+
+Transfer modes:
+- `last` - Replace only the last token's modulation (surgical injection)
+- `last_n` - Replace last N tokens' modulation
+- `avg_last` - Use averaged modulation from last tokens
 
 ## Training Commands
+
+### Sequential Layer-by-Layer Training
+```bash
+# Train NPT layers sequentially (one at a time)
+python scripts/train_sequential_layers.py \
+  --model_name "meta-llama/Llama-3.1-8B-Instruct" \
+  --model_size 8b \
+  --layers "all"  # or "15,16,17" or "upper_half"
+  --steps_per_layer 2000 \
+  --stage1_steps 500 \
+  --batch_size 2 \
+  --np_rank 256 \
+  --wandb_project "npt-sequential"
+
+# Resume from specific layer
+python scripts/train_sequential_layers.py \
+  --start_from_layer 10 \
+  --checkpoint_dir experiments/sequential_checkpoint
+```
+
+### Single-Layer Specialized Training
+```bash
+# Train single NPT layer with two-stage strategy
+python scripts/train_single_layer_npt.py \
+  --model_name "meta-llama/Llama-3.2-1B" \
+  --convert_layers 15 \
+  --single_layer_mode \
+  --np_rank 256 \
+  --stage1_steps 1000  # Attention reconstruction stage
+  --max_steps 30000 \
+  --direct_mlp_weight 10.0 \
+  --gradient_scale_factor 10.0
+```
 
 ### Production Training with Streaming & WandB
 ```bash
@@ -152,7 +236,34 @@ python scripts/train_equivalence.py \
 
 ## Training Strategy
 
-### Equivalence Pre-training (Current Phase)
+### Sequential Training Approach
+The project uses a layer-by-layer sequential training strategy where each NPT layer is trained individually before moving to the next. This approach:
+- Allows focused optimization per layer
+- Accumulates learned weights progressively
+- Enables better convergence for single-layer transformations
+
+### Single-Layer Two-Stage Training
+Each NPT layer undergoes specialized two-stage training:
+
+**Stage 1: Attention Reconstruction (steps 0-1000)**
+- Focus on training v_a to encode attention information
+- High weight on attention encoding loss (80%)
+- Minimal direct MLP supervision (10%)
+
+**Stage 2: Full Equivalence (steps 1000+)**
+- Train complete NPT transformation
+- Direct MLP supervision becomes dominant (10x weight)
+- Target: MLP_modulated(h) = attention + MLP(h + attention)
+
+### Loss Functions
+
+#### Single-Layer Losses (`src/training/single_layer_losses.py`)
+- **DirectMLPSupervisionLoss**: Teaches modulated MLP to output attn + MLP(h+attn)
+- **AttentionEncodingLoss**: Forces v_a to encode attention using MSE + cosine similarity
+- **FidelityLoss**: Ensures final model output matches original
+- **RegularizationLoss**: L2 regularization on v_a and v_b vectors
+
+#### Multi-Layer Equivalence Loss
 - **Objective**: Train NP components to mimic original residual connections
 - **Frozen**: All base model parameters
 - **Trainable**: Only W_down, W_a_up, W_b_up in each NP component
@@ -165,6 +276,21 @@ python scripts/train_equivalence.py \
 - **Multi-dataset Mixing**: Configurable dataset combinations with mixing probabilities
 
 ## Critical Implementation Details
+
+### Selective Layer Loading
+The system supports loading NPT weights while choosing which layers operate in NPT vs standard mode:
+- **NPT Mode**: No attention residual, uses rank-1 modulation
+- **Standard Mode**: Normal transformer with attention residual
+- Layers can switch modes at runtime without reloading weights
+
+### Single-Layer Mode Handling
+When loading from checkpoint, always use `single_layer_mode=False` to avoid rank multiplication (rank * 4) that occurs in training mode.
+
+### Context Transfer Mechanism
+NPT enables extracting modulation (v_a, v_b) from one context and surgically injecting it into another:
+- Captures semantic context in modulation vectors
+- Transfers only at specific positions (e.g., last token for answer generation)
+- Supports multi-layer transfer for richer context representation
 
 ### Position Embeddings Handling
 NPTDecoderLayer creates identity position embeddings (cos=1, sin=0) when not provided, ensuring compatibility with newer transformers versions that require explicit position embeddings.
@@ -183,6 +309,9 @@ Instead of forming full ΔW matrix, applies rank-1 update efficiently:
 - NP components add only ~2-5% parameters
 - Rank-1 updates avoid full weight matrix materialization
 - Selective layer conversion reduces memory footprint
+
+### Gradient Scaling for Single Layers
+Single NPT layers use 10x gradient scaling during training to compensate for learning complex transformations alone.
 
 ## Model Specifications
 
@@ -240,16 +369,23 @@ Instead of forming full ΔW matrix, applies rank-1 update efficiently:
 │   └── npt_model.py      # Hybrid NPT-Llama model
 ├── src/training/         # Training utilities
 │   ├── losses.py         # Equivalence loss functions
+│   ├── single_layer_losses.py  # Specialized single-layer losses
 │   ├── trainer.py        # NPT-specific trainer
-│   └── data_utils.py     # Streaming data utilities
+│   ├── streaming_data.py # Streaming data utilities
+│   └── wandb_integration.py # WandB tracking
 ├── scripts/              # Training & demo scripts
-│   ├── train_npt_streaming.py  # Main training script
-│   ├── train_equivalence.py    # Basic training
-│   ├── interactive_knowledge_injection.py  # Knowledge editing
+│   ├── train_sequential_layers.py  # Sequential layer-by-layer training
+│   ├── train_single_layer_npt.py   # Single layer specialized training
+│   ├── train_npt_streaming.py      # Multi-layer streaming training
+│   ├── interactive_knowledge_injection.py  # Knowledge editing with selective layers
+│   ├── npt_context_transfer.py     # Single-layer context transfer
+│   ├── npt_multi_layer_context_transfer.py # Multi-layer context transfer
 │   └── demo_*.py         # Stage-wise demos
 ├── tests/                # Test suite
 │   ├── test_np_component.py    # Stage 1 tests
 │   ├── test_npt_decoder_layer.py  # Stage 2 tests
 │   └── test_npt_model.py       # Stage 3 tests
+├── docs/                 # Documentation
+│   └── selective_npt_layers.md # Selective layer loading guide
 └── config/               # Configuration files
     └── model_config.yaml # Model configuration
