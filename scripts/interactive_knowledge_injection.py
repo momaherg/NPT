@@ -453,6 +453,46 @@ class KnowledgeInjector:
         else:
             print(f"{Fore.YELLOW}No weights to reset.{Style.RESET_ALL}")
     
+    def toggle_layer_mode(self, layer_idx: int, use_npt: Optional[bool] = None):
+        """
+        Toggle or set NPT mode for a specific layer.
+        
+        Args:
+            layer_idx: Layer index to toggle
+            use_npt: If None, toggle current state. If bool, set to that state.
+        """
+        if layer_idx not in self.available_layers:
+            print(f"{Fore.RED}Layer {layer_idx} is not an NPT layer.{Style.RESET_ALL}")
+            return
+        
+        layer = self.model.model.layers[layer_idx]
+        if not hasattr(layer, 'set_npt_mode'):
+            print(f"{Fore.RED}Layer {layer_idx} doesn't support mode switching.{Style.RESET_ALL}")
+            return
+        
+        current_mode = layer.use_npt if hasattr(layer, 'use_npt') else True
+        
+        if use_npt is None:
+            # Toggle
+            new_mode = not current_mode
+        else:
+            new_mode = use_npt
+        
+        layer.set_npt_mode(new_mode)
+        mode_str = "NPT" if new_mode else "standard (with attention residual)"
+        print(f"{Fore.GREEN}✓ Layer {layer_idx} set to {mode_str} mode{Style.RESET_ALL}")
+    
+    def get_layer_modes(self) -> Dict[int, bool]:
+        """Get current NPT mode status for all available layers."""
+        modes = {}
+        for layer_idx in self.available_layers:
+            layer = self.model.model.layers[layer_idx]
+            if hasattr(layer, 'use_npt'):
+                modes[layer_idx] = layer.use_npt
+            else:
+                modes[layer_idx] = True  # Default assumption
+        return modes
+    
     def save_modified_model(self, save_path: str):
         """Save the model with injected knowledge."""
         save_path = Path(save_path)
@@ -504,8 +544,10 @@ class InteractiveSession:
         print(f"{Fore.GREEN}inject-all <fact>{Style.RESET_ALL} - Inject a fact into all NPT layers")
         print(f"{Fore.GREEN}inject-multi{Style.RESET_ALL} - Inject multiple related facts")
         print(f"{Fore.GREEN}test <question>{Style.RESET_ALL} - Test if injected knowledge works")
-        print(f"{Fore.GREEN}layers{Style.RESET_ALL} - List all available NPT layers")
+        print(f"{Fore.GREEN}layers{Style.RESET_ALL} - List all available NPT layers and their modes")
         print(f"{Fore.GREEN}layer <idx>{Style.RESET_ALL} - Switch to a specific NPT layer")
+        print(f"{Fore.GREEN}mode <idx> [npt/standard]{Style.RESET_ALL} - Toggle or set layer mode")
+        print(f"{Fore.GREEN}modes{Style.RESET_ALL} - Show current mode for all NPT layers")
         print(f"{Fore.GREEN}reset{Style.RESET_ALL} - Reset current layer weights to original")
         print(f"{Fore.GREEN}reset-all{Style.RESET_ALL} - Reset all layers to original state")
         print(f"{Fore.GREEN}save <path>{Style.RESET_ALL} - Save modified model")
@@ -609,8 +651,9 @@ class InteractiveSession:
                     self.injector.save_modified_model(save_path)
                 
                 elif command == "layers":
-                    # Show available NPT layers
+                    # Show available NPT layers and their modes
                     info = self.injector.get_layer_info()
+                    modes = self.injector.get_layer_modes()
                     print(f"\n{Fore.CYAN}NPT Layers Information:{Style.RESET_ALL}")
                     print(f"  Available layers: {info['available_layers']}")
                     print(f"  Active layer: {Fore.GREEN}{info['active_layer']}{Style.RESET_ALL}")
@@ -620,7 +663,9 @@ class InteractiveSession:
                         rank = info.get(rank_key, "unknown")
                         facts_count = info['injected_facts_count'].get(idx, 0)
                         active_marker = " (active)" if idx == info['active_layer'] else ""
-                        print(f"    Layer {idx}: rank={rank}, injected_facts={facts_count}{active_marker}")
+                        mode = "NPT" if modes.get(idx, True) else "standard"
+                        mode_color = Fore.GREEN if modes.get(idx, True) else Fore.YELLOW
+                        print(f"    Layer {idx}: rank={rank}, mode={mode_color}{mode}{Style.RESET_ALL}, injected_facts={facts_count}{active_marker}")
                 
                 elif command == "layer":
                     # Switch to a specific layer
@@ -666,6 +711,44 @@ class InteractiveSession:
                     else:
                         print(f"{Fore.YELLOW}No facts injected yet.{Style.RESET_ALL}")
                 
+                elif command == "mode":
+                    # Toggle or set layer mode (NPT vs standard)
+                    parts = args.split()
+                    if not parts:
+                        print(f"{Fore.RED}Please provide a layer index. Usage: mode <idx> [npt/standard]{Style.RESET_ALL}")
+                        continue
+                    
+                    try:
+                        layer_idx = int(parts[0])
+                        if len(parts) > 1:
+                            mode_str = parts[1].lower()
+                            if mode_str == "npt":
+                                self.injector.toggle_layer_mode(layer_idx, use_npt=True)
+                            elif mode_str == "standard":
+                                self.injector.toggle_layer_mode(layer_idx, use_npt=False)
+                            else:
+                                print(f"{Fore.RED}Invalid mode. Use 'npt' or 'standard'.{Style.RESET_ALL}")
+                        else:
+                            # Toggle current mode
+                            self.injector.toggle_layer_mode(layer_idx)
+                    except ValueError:
+                        print(f"{Fore.RED}Invalid layer index: {parts[0]}{Style.RESET_ALL}")
+                
+                elif command == "modes":
+                    # Show current modes for all layers
+                    modes = self.injector.get_layer_modes()
+                    print(f"\n{Fore.CYAN}Current Layer Modes:{Style.RESET_ALL}")
+                    npt_layers = [idx for idx, use_npt in modes.items() if use_npt]
+                    standard_layers = [idx for idx, use_npt in modes.items() if not use_npt]
+                    
+                    if npt_layers:
+                        print(f"  {Fore.GREEN}NPT mode:{Style.RESET_ALL} {npt_layers}")
+                    if standard_layers:
+                        print(f"  {Fore.YELLOW}Standard mode:{Style.RESET_ALL} {standard_layers}")
+                    
+                    if not npt_layers and not standard_layers:
+                        print(f"  {Fore.YELLOW}No NPT layers available{Style.RESET_ALL}")
+                
                 elif command == "strength":
                     try:
                         strength = float(args)
@@ -705,6 +788,14 @@ def main():
         type=int,
         default=15,
         help="NPT layer index to use for injection"
+    )
+    parser.add_argument(
+        "--use_npt_layers",
+        type=str,
+        default=None,
+        help="Comma-separated list of layer indices to use as NPT (e.g., '15,31' or 'all'). "
+             "If not specified, all available NPT layers will be used. "
+             "Use 'none' to load weights but keep all layers as standard transformers."
     )
     parser.add_argument(
         "--injection_strength",
@@ -760,26 +851,100 @@ def main():
         layer_info = detect_npt_layers_from_weights(npt_weights)
         
         if layer_info:
-            print(f"  Detected NPT layers: {sorted(layer_info.keys())}")
+            available_layers = sorted(layer_info.keys())
+            print(f"  Detected NPT weights for layers: {available_layers}")
             
             # Show rank information
             for layer_idx, rank in layer_info.items():
                 print(f"    Layer {layer_idx}: rank={rank}")
             
-            # Convert all detected layers to NPT
-            all_layers = sorted(layer_info.keys())
+            # Determine which layers to actually use as NPT
+            if args.use_npt_layers is None:
+                # Default: use all available NPT layers
+                layers_to_use = available_layers
+                print(f"  Using all available NPT layers (default)")
+            elif args.use_npt_layers.lower() == 'all':
+                # Explicitly use all
+                layers_to_use = available_layers
+                print(f"  Using all available NPT layers")
+            elif args.use_npt_layers.lower() == 'none':
+                # Load weights but don't use NPT mode for any layer
+                layers_to_use = []
+                print(f"  {Fore.YELLOW}Loading NPT weights but keeping all layers as standard transformers{Style.RESET_ALL}")
+            else:
+                # Parse specific layer indices
+                try:
+                    requested_layers = [int(x.strip()) for x in args.use_npt_layers.split(',')]
+                    # Filter to only layers that have weights available
+                    layers_to_use = [l for l in requested_layers if l in available_layers]
+                    if len(layers_to_use) < len(requested_layers):
+                        missing = [l for l in requested_layers if l not in available_layers]
+                        print(f"  {Fore.YELLOW}Warning: Requested layers {missing} don't have NPT weights{Style.RESET_ALL}")
+                    print(f"  Using NPT mode for layers: {layers_to_use}")
+                except ValueError:
+                    print(f"  {Fore.RED}Invalid --use_npt_layers format. Using all available layers.{Style.RESET_ALL}")
+                    layers_to_use = available_layers
             
-            # Use the rank from the first layer (they might differ, but we'll handle that in load)
-            detected_rank = list(layer_info.values())[0]
+            # Show which layers will be in which mode
+            if layers_to_use:
+                standard_layers = [l for l in available_layers if l not in layers_to_use]
+                if standard_layers:
+                    print(f"  {Fore.CYAN}Layers {standard_layers} will operate in standard mode (with attention residual){Style.RESET_ALL}")
+            else:
+                print(f"  {Fore.CYAN}All layers will operate in standard mode (with attention residual){Style.RESET_ALL}")
             
-            npt_config = NPTConfig(
-                layers_to_convert=all_layers,
-                np_rank=detected_rank,
-                np_init_scale=0.001,
-                single_layer_mode=False  # Multi-layer mode
-            )
-            model.convert_to_npt(npt_config)
-            print(f"  Converted {len(all_layers)} layers to NPT")
+            # Convert only the selected layers to NPT  
+            if layers_to_use:
+                # Group layers by rank for efficient conversion
+                layers_by_rank = {}
+                for layer_idx in layers_to_use:
+                    rank = layer_info[layer_idx]
+                    if rank not in layers_by_rank:
+                        layers_by_rank[rank] = []
+                    layers_by_rank[rank].append(layer_idx)
+                
+                if len(layers_by_rank) == 1:
+                    # All selected layers have the same rank - convert together
+                    detected_rank = list(layers_by_rank.keys())[0]
+                    
+                    npt_config = NPTConfig(
+                        layers_to_convert=layers_to_use,
+                        np_rank=detected_rank,
+                        np_init_scale=0.001,
+                        single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
+                    )
+                    model.convert_to_npt(npt_config)
+                    print(f"  Converted {len(layers_to_use)} layers to NPT mode with rank={detected_rank}")
+                else:
+                    # Different ranks for different groups - convert by rank groups
+                    print(f"  {Fore.YELLOW}Detected different ranks, converting by rank groups:{Style.RESET_ALL}")
+                    for rank, layer_indices in sorted(layers_by_rank.items()):
+                        npt_config = NPTConfig(
+                            layers_to_convert=layer_indices,
+                            np_rank=rank,
+                            np_init_scale=0.001,
+                            single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
+                        )
+                        model.convert_to_npt(npt_config)
+                        print(f"    Converted layers {layer_indices} with rank={rank}")
+                    print(f"  Total: Converted {len(layers_to_use)} layers to NPT mode")
+                
+                # Load NPT weights for all available layers (even those not in NPT mode)
+                # This allows switching modes later if desired
+                model.load_npt_weights(npt_weights)
+                
+                # For layers not in NPT mode but with weights available, 
+                # ensure they operate in standard mode
+                for layer_idx in available_layers:
+                    if layer_idx in model.model.layers and hasattr(model.model.layers[layer_idx], 'set_npt_mode'):
+                        if layer_idx not in layers_to_use:
+                            model.model.layers[layer_idx].set_npt_mode(False)
+                            print(f"    Set layer {layer_idx} to standard mode")
+            else:
+                # No layers in NPT mode, but still might want to have the architecture
+                # This is useful for comparison experiments
+                print(f"  {Fore.YELLOW}No layers will use NPT mode (standard transformer behavior){Style.RESET_ALL}")
+                # Don't convert any layers, model remains standard
         else:
             # Fallback to single layer if no layers detected
             print(f"  No NPT layers detected in checkpoint, converting layer {args.layer_idx}")
@@ -787,12 +952,12 @@ def main():
                 layers_to_convert=[args.layer_idx],
                 np_rank=256,
                 np_init_scale=0.001,
-                single_layer_mode=False
+                single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
             )
             model.convert_to_npt(npt_config)
+            # Load any available weights
+            model.load_npt_weights(npt_weights)
         
-        # Load NPT weights (pass the loaded dict, not the path)
-        model.load_npt_weights(npt_weights)
         print(f"{Fore.GREEN}✓ Checkpoint loaded successfully!{Style.RESET_ALL}")
     
     else:

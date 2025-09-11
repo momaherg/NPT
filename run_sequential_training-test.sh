@@ -9,11 +9,11 @@ MODEL_SIZE="8b"
 LAYERS="0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31"
 # All 16 layers for 1B model
 # 0,1,2,3,4,5,6,7,8,9,10,11,12,13,
-STEPS_PER_LAYER=4000
+STEPS_PER_LAYER=2300
 STAGE1_STEPS=700
 BATCH_SIZE=1
 DATASET="small"
-NUM_LAYERS=32
+NUM_LAYERS=64
 
 echo "=========================================="
 echo "Sequential NPT Training Configuration"
@@ -39,6 +39,6 @@ python scripts/train_sequential_layers.py \
     --np_rank 256 \
     --dataset_preset "$DATASET" \
     --max_length 512 \
-    --wandb_project "npt-sequential" \
+    --wandb_project "npt-sequential-testing" \
     --wandb_mode "online" \
     $DEMO_FLAG
