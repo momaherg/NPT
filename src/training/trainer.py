@@ -479,11 +479,19 @@ class NPTTrainer:
                 # Log metrics
                 if self.global_step % self.config.logging_steps == 0:
                     self._log_metrics(metrics)
-                    pbar.set_postfix({
-                        'loss': f"{metrics.total_loss:.4f}",
-                        'fidelity': f"{metrics.fidelity_loss:.4f}",
-                        'lr': f"{metrics.learning_rate:.2e}"
-                    })
+                    # Handle both dict and object metrics
+                    if isinstance(metrics, dict):
+                        pbar.set_postfix({
+                            'loss': f"{metrics.get('total_loss', metrics.get('loss', 0)):.4f}",
+                            'fidelity': f"{metrics.get('fidelity_loss', 0):.4f}",
+                            'lr': f"{metrics.get('learning_rate', 0):.2e}"
+                        })
+                    else:
+                        pbar.set_postfix({
+                            'loss': f"{metrics.total_loss:.4f}",
+                            'fidelity': f"{metrics.fidelity_loss:.4f}",
+                            'lr': f"{metrics.learning_rate:.2e}"
+                        })
                 
                 # Evaluate
                 if self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:

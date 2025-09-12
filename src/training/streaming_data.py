@@ -6,13 +6,14 @@ without loading entire datasets into memory.
 """
 
 import torch
-from torch.utils.data import IterableDataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader, Dataset
 from datasets import load_dataset, interleave_datasets
 from transformers import AutoTokenizer
 from typing import Dict, List, Optional, Union, Iterator, Any
 import numpy as np
 from dataclasses import dataclass
 import logging
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +204,164 @@ class StreamingTextDataset(IterableDataset):
             }
 
 
+class FixedValidationDataset(Dataset):
+    """
+    Fixed validation dataset that loads and caches a specific number of samples.
+    
+    This provides consistent validation metrics across training steps.
+    """
+    
+    def __init__(
+        self,
+        tokenizer: AutoTokenizer,
+        dataset_name: str = "wikitext",
+        dataset_config: str = "wikitext-2-raw-v1",
+        max_length: int = 512,
+        num_samples: int = 1000,
+        seed: int = 42,
+        cache_file: Optional[str] = None
+    ):
+        """
+        Initialize fixed validation dataset.
+        
+        Args:
+            tokenizer: Tokenizer for encoding
+            dataset_name: Name of HuggingFace dataset
+            dataset_config: Configuration for dataset
+            max_length: Maximum sequence length
+            num_samples: Number of validation samples to cache
+            seed: Random seed for reproducibility
+            cache_file: Optional path to save/load cached dataset
+        """
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.num_samples = num_samples
+        self.cache_file = cache_file
+        
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        
+        # Try to load from cache first
+        if cache_file and Path(cache_file).exists():
+            logger.info(f"Loading cached validation dataset from {cache_file}")
+            import pickle
+            with open(cache_file, 'rb') as f:
+                self.samples = pickle.load(f)
+            logger.info(f"Loaded {len(self.samples)} cached validation samples")
+            return
+        
+        logger.info(f"Loading fixed validation dataset: {dataset_name}/{dataset_config}")
+        
+        # Load validation split
+        try:
+            dataset = load_dataset(
+                dataset_name,
+                dataset_config if dataset_config else None,
+                split='validation',
+                streaming=False  # Load into memory
+            )
+        except:
+            # Fallback to test split or subset of train
+            try:
+                dataset = load_dataset(
+                    dataset_name,
+                    dataset_config if dataset_config else None,
+                    split='test',
+                    streaming=False
+                )
+            except:
+                # Last resort: use a subset of train
+                dataset = load_dataset(
+                    dataset_name,
+                    dataset_config if dataset_config else None,
+                    split=f'train[:{num_samples*2}]',
+                    streaming=False
+                )
+        
+        # Process and cache samples
+        self.samples = []
+        token_buffer = []
+        
+        # Set seed for reproducibility
+        np.random.seed(seed)
+        
+        # Faster: Take a continuous slice instead of random indices
+        # This reduces random access overhead
+        total_size = len(dataset)
+        start_idx = seed % max(1, total_size - num_samples * 5)
+        end_idx = min(start_idx + num_samples * 5, total_size)
+        
+        # Batch tokenization for speed
+        batch_texts = []
+        for idx in range(start_idx, end_idx):
+            if len(self.samples) >= num_samples:
+                break
+            text = dataset[idx].get('text', '')
+            if text and len(text.strip()) > 0:
+                batch_texts.append(text)
+            
+            # Process in batches of 100 texts
+            if len(batch_texts) >= 100 or idx == end_idx - 1:
+                if batch_texts:
+                    # Batch tokenization is much faster
+                    batch_tokens = tokenizer(
+                        batch_texts,
+                        truncation=False,
+                        add_special_tokens=True,
+                        return_attention_mask=False
+                    )['input_ids']
+                    
+                    # Process each tokenized text
+                    for tokens in batch_tokens:
+                        token_buffer.extend(tokens)
+                        
+                        # Create fixed-length chunks
+                        while len(token_buffer) >= max_length and len(self.samples) < num_samples:
+                            chunk = token_buffer[:max_length]
+                            self.samples.append({
+                                'input_ids': torch.tensor(chunk, dtype=torch.long),
+                                'attention_mask': torch.ones(max_length, dtype=torch.long),
+                                'labels': torch.tensor(chunk, dtype=torch.long)
+                            })
+                            token_buffer = token_buffer[max_length // 2:]  # 50% overlap
+                    
+                    batch_texts = []
+        
+        # Handle remaining tokens if we don't have enough samples
+        if len(self.samples) < num_samples and len(token_buffer) >= 32:
+            chunk = token_buffer[:max_length]
+            if len(chunk) < max_length:
+                padding_length = max_length - len(chunk)
+                chunk = chunk + [tokenizer.pad_token_id] * padding_length
+                attention_mask = [1] * len(token_buffer[:max_length]) + [0] * padding_length
+            else:
+                attention_mask = [1] * max_length
+            
+            self.samples.append({
+                'input_ids': torch.tensor(chunk, dtype=torch.long),
+                'attention_mask': torch.tensor(attention_mask, dtype=torch.long),
+                'labels': torch.tensor(chunk, dtype=torch.long)
+            })
+        
+        logger.info(f"Cached {len(self.samples)} validation samples")
+        
+        # Save to cache if requested
+        if cache_file:
+            logger.info(f"Saving validation dataset cache to {cache_file}")
+            import pickle
+            cache_path = Path(cache_file)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(cache_path, 'wb') as f:
+                pickle.dump(self.samples, f)
+            logger.info(f"Cache saved to {cache_file}")
+    
+    def __len__(self):
+        return len(self.samples)
+    
+    def __getitem__(self, idx):
+        return self.samples[idx]
+
+
 class MultiDatasetStreamer:
     """
     Advanced streamer for multiple HuggingFace datasets.
@@ -272,7 +431,9 @@ class MultiDatasetStreamer:
     def create_data_loaders(
         self,
         validation: bool = True,
-        mix_probabilities: Optional[List[float]] = None
+        mix_probabilities: Optional[List[float]] = None,
+        fixed_validation: bool = True,
+        num_validation_samples: int = 500
     ) -> tuple[DataLoader, Optional[DataLoader]]:
         """
         Create streaming data loaders.
@@ -280,6 +441,8 @@ class MultiDatasetStreamer:
         Args:
             validation: Whether to create validation loader
             mix_probabilities: Custom mixing probabilities
+            fixed_validation: Whether to use fixed validation dataset
+            num_validation_samples: Number of validation samples for fixed validation
         
         Returns:
             Tuple of (train_loader, val_loader)
@@ -312,30 +475,89 @@ class MultiDatasetStreamer:
         # Create validation loader if requested
         val_loader = None
         if validation:
-            # Use a different split or subset for validation
-            val_config = StreamingConfig(
-                dataset_name=self.dataset_names[0],  # Use first dataset for validation
-                dataset_config=self.dataset_configs[0],
-                split='validation' if 'validation' in ['train', 'validation', 'test'] else 'train',
-                max_length=self.max_length,
-                num_workers=self.num_workers
-            )
-            
-            val_dataset = StreamingTextDataset(
-                config=val_config,
-                tokenizer=self.tokenizer,
-                is_validation=True
-            )
-            
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.batch_size,
-                num_workers=self.num_workers if self.num_workers > 0 else 0,
-                pin_memory=torch.cuda.is_available(),
-                prefetch_factor=2 if self.num_workers > 0 else None
-            )
+            if fixed_validation:
+                # Use fixed validation dataset for consistent metrics
+                val_loader = create_fixed_validation_loader(
+                    tokenizer=self.tokenizer,
+                    dataset_name=self.dataset_names[0],  # Use first dataset for validation
+                    dataset_config=self.dataset_configs[0],
+                    batch_size=self.batch_size,
+                    max_length=self.max_length,
+                    num_validation_samples=num_validation_samples,
+                    num_workers=0,  # Fixed dataset doesn't benefit from multiple workers
+                    seed=42
+                )
+            else:
+                # Use streaming validation
+                val_config = StreamingConfig(
+                    dataset_name=self.dataset_names[0],  # Use first dataset for validation
+                    dataset_config=self.dataset_configs[0],
+                    split='validation' if 'validation' in ['train', 'validation', 'test'] else 'train',
+                    max_length=self.max_length,
+                    num_workers=self.num_workers
+                )
+                
+                val_dataset = StreamingTextDataset(
+                    config=val_config,
+                    tokenizer=self.tokenizer,
+                    is_validation=True
+                )
+                
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=self.batch_size,
+                    num_workers=self.num_workers if self.num_workers > 0 else 0,
+                    pin_memory=torch.cuda.is_available(),
+                    prefetch_factor=2 if self.num_workers > 0 else None
+                )
         
         return train_loader, val_loader
+
+
+def create_fixed_validation_loader(
+    tokenizer: AutoTokenizer,
+    dataset_name: str = "wikitext",
+    dataset_config: str = "wikitext-2-raw-v1",
+    batch_size: int = 8,
+    max_length: int = 512,
+    num_validation_samples: int = 500,
+    num_workers: int = 0,
+    seed: int = 42
+) -> DataLoader:
+    """
+    Create a fixed validation data loader with cached samples.
+    
+    Args:
+        tokenizer: Tokenizer for encoding
+        dataset_name: Name of HuggingFace dataset
+        dataset_config: Configuration for dataset
+        batch_size: Batch size
+        max_length: Maximum sequence length
+        num_validation_samples: Number of validation samples to cache
+        num_workers: Number of data workers (0 recommended for cached data)
+        seed: Random seed for reproducibility
+    
+    Returns:
+        DataLoader with fixed validation samples
+    """
+    val_dataset = FixedValidationDataset(
+        tokenizer=tokenizer,
+        dataset_name=dataset_name,
+        dataset_config=dataset_config,
+        max_length=max_length,
+        num_samples=num_validation_samples,
+        seed=seed
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,  # Don't shuffle to maintain consistency
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available()
+    )
+    
+    return val_loader
 
 
 def create_streaming_loaders(
@@ -347,7 +569,9 @@ def create_streaming_loaders(
     stride: int = 256,
     num_workers: int = 4,
     streaming: bool = True,
-    validation: bool = True
+    validation: bool = True,
+    fixed_validation: bool = False,
+    num_validation_samples: int = 500
 ) -> tuple[DataLoader, Optional[DataLoader]]:
     """
     Create streaming data loaders from HuggingFace datasets.
@@ -362,6 +586,8 @@ def create_streaming_loaders(
         num_workers: Number of data workers
         streaming: Whether to use streaming mode
         validation: Whether to create validation loader
+        fixed_validation: Whether to use fixed validation dataset
+        num_validation_samples: Number of validation samples for fixed validation
     
     Returns:
         Tuple of (train_loader, val_loader)
@@ -395,31 +621,45 @@ def create_streaming_loaders(
     # Create validation loader
     val_loader = None
     if validation:
-        val_config = StreamingConfig(
-            dataset_name=dataset_name if isinstance(dataset_name, str) else dataset_name[0],
-            dataset_config=dataset_config if isinstance(dataset_config, str) else dataset_config[0],
-            split='validation',
-            max_length=max_length,
-            stride=stride,
-            num_workers=num_workers,
-            streaming=streaming
-        )
-        
-        try:
-            val_dataset = StreamingTextDataset(
-                config=val_config,
+        if fixed_validation:
+            # Use fixed validation dataset for consistent metrics
+            val_loader = create_fixed_validation_loader(
                 tokenizer=tokenizer,
-                is_validation=True
+                dataset_name=dataset_name if isinstance(dataset_name, str) else dataset_name[0],
+                dataset_config=dataset_config if isinstance(dataset_config, str) else dataset_config[0],
+                batch_size=batch_size,
+                max_length=max_length,
+                num_validation_samples=num_validation_samples,
+                num_workers=0,  # Fixed dataset doesn't benefit from multiple workers
+                seed=42
+            )
+        else:
+            # Use streaming validation
+            val_config = StreamingConfig(
+                dataset_name=dataset_name if isinstance(dataset_name, str) else dataset_name[0],
+                dataset_config=dataset_config if isinstance(dataset_config, str) else dataset_config[0],
+                split='validation',
+                max_length=max_length,
+                stride=stride,
+                num_workers=num_workers,
+                streaming=streaming
             )
             
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size,
-                num_workers=num_workers if num_workers > 0 else 0,
-                pin_memory=torch.cuda.is_available(),
-                prefetch_factor=2 if num_workers > 0 else None
-            )
-        except:
-            logger.warning("Could not create validation loader, using None")
+            try:
+                val_dataset = StreamingTextDataset(
+                    config=val_config,
+                    tokenizer=tokenizer,
+                    is_validation=True
+                )
+                
+                val_loader = DataLoader(
+                    val_dataset,
+                    batch_size=batch_size,
+                    num_workers=num_workers if num_workers > 0 else 0,
+                    pin_memory=torch.cuda.is_available(),
+                    prefetch_factor=2 if num_workers > 0 else None
+                )
+            except:
+                logger.warning("Could not create validation loader, using None")
     
     return train_loader, val_loader

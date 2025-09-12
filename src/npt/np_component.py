@@ -239,59 +239,6 @@ class NPComponent(nn.Module):
             
             return v_a, v_b
     
-    def compute_delta_w(self, attn_output: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the rank-1 weight delta ΔW from attention output.
-        
-        This is a convenience method that computes the outer product of v_b and v_a.
-        Note: In practice, applying the weight update can be done more efficiently
-        without explicitly forming the full matrix.
-        
-        Args:
-            attn_output: Attention output tensor of shape (batch_size, seq_len, d_model)
-        
-        Returns:
-            ΔW tensor of shape (batch_size, seq_len, d_ffn, d_model)
-        """
-        v_a, v_b = self.forward(attn_output)
-        
-        # Compute outer product for each token
-        # We need to add dimensions for the outer product
-        # v_b: (batch_size, seq_len, d_ffn) -> (batch_size, seq_len, d_ffn, 1)
-        # v_a: (batch_size, seq_len, d_model) -> (batch_size, seq_len, 1, d_model)
-        v_b_expanded = v_b.unsqueeze(-1)  # (batch_size, seq_len, d_ffn, 1)
-        v_a_expanded = v_a.unsqueeze(-2)  # (batch_size, seq_len, 1, d_model)
-        
-        # Outer product: (batch_size, seq_len, d_ffn, 1) * (batch_size, seq_len, 1, d_model)
-        # -> (batch_size, seq_len, d_ffn, d_model)
-        delta_w = v_b_expanded * v_a_expanded
-        
-        return delta_w
-    
-    def get_regularization_loss(self, v_a: torch.Tensor, v_b: torch.Tensor) -> torch.Tensor:
-        """
-        Compute L2 regularization loss on generated vectors.
-        
-        This encourages low-magnitude weight updates during training.
-        
-        Args:
-            v_a: Vector of shape (batch_size, seq_len, d_model) for rank-1
-                 or (batch_size, seq_len, num_ranks, d_model) for rank-k
-            v_b: Vector of shape (batch_size, seq_len, d_ffn) for rank-1
-                 or (batch_size, seq_len, num_ranks, d_ffn) for rank-k
-        
-        Returns:
-            Scalar regularization loss
-        """
-        # L2 norm squared of the vectors - works for both rank-1 and rank-k
-        if v_a.dim() == 3:
-            # Rank-1 case
-            reg_loss = torch.mean(torch.sum(v_a ** 2, dim=-1)) + torch.mean(torch.sum(v_b ** 2, dim=-1))
-        else:
-            # Rank-k case: sum over all components
-            reg_loss = torch.mean(torch.sum(v_a ** 2, dim=(-2, -1))) + torch.mean(torch.sum(v_b ** 2, dim=(-2, -1)))
-        return reg_loss
-    
     def extra_repr(self) -> str:
         """String representation for printing the module."""
         base_repr = f'd_model={self.d_model}, d_ffn={self.d_ffn}, rank={self.rank}, init_scale={self.init_scale}'

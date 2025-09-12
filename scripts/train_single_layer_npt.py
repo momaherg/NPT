@@ -16,9 +16,11 @@ Key features:
 import argparse
 import sys
 from pathlib import Path
+import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import logging
 from datetime import datetime
 import json
@@ -37,11 +39,8 @@ from src.training.streaming_data import (
 )
 from src.training.wandb_integration import WandBTracker
 from src.training.single_layer_losses import (
-    SingleLayerEquivalenceLoss,
     DirectSupervisionLoss,
-    GuidedSupervisionLoss,
-    GradientScaler,
-    check_mode_collapse
+    GradientScaler
 )
 from transformers import AutoTokenizer, LlamaConfig, AutoConfig
 import wandb
@@ -114,15 +113,6 @@ def parse_args():
         help="Initialization strategy: improved (better gradient flow) or conservative (original)"
     )
     
-    # Loss configuration
-    parser.add_argument(
-        "--loss_mode",
-        type=str,
-        choices=["direct", "guided", "staged"],
-        default="direct",
-        help="Loss mode: direct (recommended), guided (with attention hint), staged (old behavior)"
-    )
-    
     # Loss weights
     parser.add_argument(
         "--direct_mlp_weight",
@@ -131,31 +121,12 @@ def parse_args():
         help="Weight for direct MLP supervision loss"
     )
     parser.add_argument(
-        "--attention_encoding_weight",
-        type=float,
-        default=1.0,  # Reduced default
-        help="Weight for attention encoding loss (only for guided/staged modes)"
-    )
-    parser.add_argument(
         "--fidelity_weight",
         type=float,
         default=0.1,  # Reduced default for direct mode
         help="Weight for final output fidelity loss"
     )
     
-    # Training stages
-    parser.add_argument(
-        "--stage1_steps",
-        type=int,
-        default=1000,
-        help="Number of steps for attention reconstruction stage"
-    )
-    parser.add_argument(
-        "--stage1_lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for stage 1"
-    )
     parser.add_argument(
         "--gradient_scale_factor",
         type=float,
@@ -313,15 +284,28 @@ def parse_args():
         help="Random seed"
     )
     parser.add_argument(
-        "--demo_mode",
+        "--fixed_validation",
         action="store_true",
-        help="Run in demo mode with small model and limited steps"
+        default=True,
+        help="Use fixed validation dataset for consistent metrics (recommended)"
     )
     parser.add_argument(
-        "--load_npt_weights",
+        "--num_validation_samples",
+        type=int,
+        default=200,  # Reduced default for faster evaluation
+        help="Number of validation samples to cache for fixed validation"
+    )
+    parser.add_argument(
+        "--validation_batch_size",
+        type=int,
+        default=16,  # Larger batch size for faster evaluation
+        help="Batch size for validation (can be larger than training batch)"
+    )
+    parser.add_argument(
+        "--validation_cache_file",
         type=str,
         default=None,
-        help="Path to previously trained NPT weights to load (for sequential training)"
+        help="Path to cache validation dataset for faster loading"
     )
     
     return parser.parse_args()
@@ -329,16 +313,6 @@ def parse_args():
 
 def get_model_config(args):
     """Get model configuration based on size preset."""
-    if args.demo_mode:
-        return LlamaConfig(
-            hidden_size=256,
-            intermediate_size=1024,
-            num_hidden_layers=4,
-            num_attention_heads=8,
-            num_key_value_heads=4,
-            vocab_size=128256,
-        )
-    
     configs = {
         "1b": LlamaConfig(
             hidden_size=2048,
@@ -383,7 +357,7 @@ def setup_single_layer_model(args):
         config._attn_implementation = "eager"
     
     # Create model
-    if args.model_name and "demo" not in args.model_size:
+    if args.model_name:
         try:
             model = NPTLlamaModel.from_pretrained(args.model_name)
             logger.info(f"Loaded pretrained model from {args.model_name}")
@@ -410,30 +384,6 @@ def setup_single_layer_model(args):
     # Convert the single layer
     model.convert_to_npt(npt_config)
     
-    # Load previously trained NPT weights if provided
-    if args.load_npt_weights:
-        logger.info(f"Loading NPT weights from {args.load_npt_weights}")
-        try:
-            if args.load_npt_weights.endswith('.pt'):
-                # Direct weights file
-                npt_weights = torch.load(args.load_npt_weights, map_location='cpu')
-            else:
-                # Directory with accumulated weights
-                weights_path = Path(args.load_npt_weights) / "accumulated_npt_weights.pt"
-                npt_weights = torch.load(weights_path, map_location='cpu')
-            
-            # Load only weights for other layers (not the current one being trained)
-            filtered_weights = {}
-            for key, value in npt_weights.items():
-                if f"layers.{layer_idx}." not in key:
-                    filtered_weights[key] = value
-            
-            if filtered_weights:
-                model.load_npt_weights(filtered_weights)
-                logger.info(f"Loaded NPT weights for {len(filtered_weights)} parameters from other layers")
-        except Exception as e:
-            logger.warning(f"Could not load NPT weights: {e}")
-    
     # Freeze base parameters
     model.freeze_base_parameters()
     
@@ -459,57 +409,40 @@ class SingleLayerNPTTrainer(NPTTrainer):
         train_loader,
         val_loader,
         layer_idx,
-        stage1_steps=1000,
-        stage1_lr=1e-3,
         gradient_scale_factor=10.0,
         loss_config=None,
         tracker=None,
         tokenizer=None,
+        fixed_validation=False,
         **kwargs
     ):
         super().__init__(model, config, train_loader, val_loader, **kwargs)
         
         self.layer_idx = layer_idx
-        self.stage1_steps = stage1_steps
-        self.stage1_lr = stage1_lr
         self.gradient_scale_factor = gradient_scale_factor
         self.tracker = tracker
         self.tokenizer = tokenizer
         self.device = config.device
+        self.fixed_validation = fixed_validation
         
-        # Initialize appropriate loss function based on mode
-        loss_mode = loss_config.get('loss_mode', 'direct')
+        # Set wandb_run for parent class compatibility
+        if tracker and hasattr(tracker, 'run'):
+            self.wandb_run = tracker.run
+        else:
+            self.wandb_run = None
         
-        if loss_mode == 'direct':
-            self.loss_fn = DirectSupervisionLoss(
-                direct_mlp_weight=loss_config.get('direct_mlp_weight', 1.0),
-                fidelity_weight=loss_config.get('fidelity_weight', 0.1),
-                regularization_weight=loss_config.get('regularization_weight', 0.001)
-            )
-        elif loss_mode == 'guided':
-            self.loss_fn = GuidedSupervisionLoss(
-                direct_mlp_weight=loss_config.get('direct_mlp_weight', 100.0),
-                attention_encoding_weight=loss_config.get('attention_encoding_weight', 1.0),
-                fidelity_weight=loss_config.get('fidelity_weight', 10.0),
-                regularization_weight=loss_config.get('regularization_weight', 0.001)
-            )
-        else:  # staged (old behavior)
-            self.loss_fn = SingleLayerEquivalenceLoss(**loss_config)
+        # Initialize loss function
+        self.loss_fn = DirectSupervisionLoss(
+            direct_mlp_weight=loss_config.get('direct_mlp_weight', 1.0),
+            fidelity_weight=loss_config.get('fidelity_weight', 0.1),
+            regularization_weight=loss_config.get('regularization_weight', 0.001)
+        )
         
         # Initialize gradient scaler
         self.gradient_scaler = GradientScaler(scale_factor=gradient_scale_factor)
-        
-        # Generation prompts
-        self.generation_prompts = [
-            "The future of artificial intelligence",
-            "Once upon a time in a distant galaxy",
-            "The key to understanding neural networks",
-        ]
     
     def get_lr(self):
-        """Get current learning rate based on training stage."""
-        if self.global_step < self.stage1_steps:
-            return self.stage1_lr
+        """Get current learning rate."""
         return self.config.learning_rate
     
     def collect_single_layer_outputs(self, input_ids):
@@ -676,12 +609,7 @@ class SingleLayerNPTTrainer(NPTTrainer):
         # Collect outputs
         outputs = self.collect_single_layer_outputs(input_ids)
         
-        # Check for mode collapse
-        if self.global_step % 100 == 0:
-            if check_mode_collapse(outputs['v_a'], outputs['v_b']):
-                logger.warning(f"Mode collapse detected at step {self.global_step}")
-        
-        # Compute loss with stage-based weighting
+        # Compute loss
         loss_output = self.loss_fn(outputs, current_step=self.global_step)
         loss = loss_output.total_loss
         
@@ -715,96 +643,30 @@ class SingleLayerNPTTrainer(NPTTrainer):
         else:
             self.optimizer.step()
         
-        # Learning rate scheduler (adjust based on stage)
-        if self.scheduler and self.global_step >= self.stage1_steps:
+        # Learning rate scheduler
+        if self.scheduler:
             self.scheduler.step()
         
-        # Create metrics
-        from dataclasses import dataclass
-        @dataclass
-        class Metrics:
-            step: int
-            total_loss: float
-            direct_mlp_loss: float
-            attention_encoding_loss: float
-            fidelity_loss: float
-            regularization_loss: float
-            learning_rate: float
-            grad_norm: float
-            v_a_attention_similarity: float
-            v_a_norm: float
-            v_b_norm: float
-            modulation_magnitude: float
-            stage: int
+        # Return metrics as a simple dict that parent can log
+        metrics = {
+            'step': self.global_step,
+            'loss': loss.item(),  # Use 'loss' not 'total_loss' for consistency
+            'total_loss': loss.item(),
+            'direct_mlp_loss': loss_output.metrics['direct_mlp_loss'],
+            'attention_encoding_loss': loss_output.metrics['attention_encoding_loss'],
+            'fidelity_loss': loss_output.metrics['fidelity_loss'],
+            'regularization_loss': loss_output.metrics['regularization_loss'],
+            'learning_rate': self.get_lr(),
+            'grad_norm': grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+            'v_a_attention_similarity': loss_output.metrics['v_a_attention_similarity'],
+            'v_a_norm': loss_output.metrics['v_a_norm'],
+            'v_b_norm': loss_output.metrics['v_b_norm'],
+            'modulation_magnitude': loss_output.metrics['modulation_magnitude']
+        }
         
-        # Get metrics from loss_output, which already contains the loss values
-        metrics = Metrics(
-            step=self.global_step,
-            total_loss=loss.item(),
-            direct_mlp_loss=loss_output.metrics['direct_mlp_loss'],
-            attention_encoding_loss=loss_output.metrics['attention_encoding_loss'],
-            fidelity_loss=loss_output.metrics['fidelity_loss'],
-            regularization_loss=loss_output.metrics['regularization_loss'],
-            learning_rate=self.get_lr(),
-            grad_norm=grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-            v_a_attention_similarity=loss_output.metrics['v_a_attention_similarity'],
-            v_a_norm=loss_output.metrics['v_a_norm'],
-            v_b_norm=loss_output.metrics['v_b_norm'],
-            modulation_magnitude=loss_output.metrics['modulation_magnitude'],
-            stage=loss_output.metrics['stage']
-        )
-        
-        # Log metrics
-        if self.tracker and self.global_step % self.config.logging_steps == 0:
-            self.tracker.log_metrics(vars(metrics), step=self.global_step)
-            
-            # Log stage transition (only for staged mode)
-            if hasattr(self.loss_fn, 'stage1_steps') and self.global_step == self.stage1_steps:
-                logger.info("=" * 80)
-                logger.info("STAGE TRANSITION: Moving from attention reconstruction to full equivalence")
-                logger.info(f"v_a attention similarity: {metrics.v_a_attention_similarity:.3f}")
-                logger.info(f"v_a norm: {metrics.v_a_norm:.3f}, v_b norm: {metrics.v_b_norm:.3f}")
-                logger.info("=" * 80)
-        
-        # Generate samples periodically
-        if (self.tokenizer and 
-            self.global_step % self.config.generation_steps == 0 and
-            self.global_step > 0):
-            self.generate_samples()
-        
-        self.global_step += 1
+        # Don't log here - parent trainer will handle it
+        # DON'T increment global_step - parent trainer does this!
         return metrics
-    
-    def generate_samples(self):
-        """Generate samples to monitor training progress."""
-        self.model.eval()
-        
-        print(f"\n{'='*80}")
-        print(f"Generating samples at step {self.global_step} (Stage {1 if self.global_step < self.stage1_steps else 2})")
-        print(f"{'='*80}")
-        
-        for prompt in self.generation_prompts[:2]:
-            inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=50)
-            input_ids = inputs.input_ids.to(self.device)
-            
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    input_ids,
-                    max_length=50,
-                    temperature=0.8,
-                    do_sample=True,
-                    top_p=0.9,
-                    pad_token_id=self.tokenizer.pad_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                )
-            
-            generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            print(f"\nPrompt: {prompt}")
-            print(f"Generated: {generated_text}")
-        
-        print(f"{'='*80}\n")
-        
-        self.model.train()
     
     def evaluate(self, eval_loader=None):
         """Override evaluate to handle single-layer loss signature."""
@@ -822,15 +684,23 @@ class SingleLayerNPTTrainer(NPTTrainer):
         total_fidelity = 0.0
         total_batches = 0
         
+        # Use half precision for evaluation if available
+        use_amp = torch.cuda.is_available() and self.config.mixed_precision
+        
         with torch.no_grad():
             for batch_idx, batch in enumerate(eval_loader):
-                if batch_idx >= 10:  # Limit evaluation batches
+                # Only limit batches for streaming validation
+                if not self.fixed_validation and batch_idx >= 10:
                     break
                 
                 input_ids = batch['input_ids'].to(self.device)
                 
-                # Collect outputs for single-layer evaluation
-                outputs = self.collect_single_layer_outputs(input_ids)
+                # Use autocast for faster evaluation
+                if use_amp:
+                    with torch.cuda.amp.autocast():
+                        outputs = self.collect_single_layer_outputs(input_ids)
+                else:
+                    outputs = self.collect_single_layer_outputs(input_ids)
                 
                 # Compute loss using single-layer loss function
                 loss_output = self.loss_fn(outputs, current_step=self.global_step)
@@ -849,6 +719,12 @@ class SingleLayerNPTTrainer(NPTTrainer):
             'val_fidelity_loss': total_fidelity / max(1, total_batches),
         }
         
+        # Log to console (parent trainer will handle WandB logging)
+        if total_batches > 0:
+            logger.info(f"Step {self.global_step} - Validation: loss={metrics['val_loss']:.4f}, "
+                       f"direct_mlp={metrics['val_direct_mlp_loss']:.4f}, "
+                       f"fidelity={metrics['val_fidelity_loss']:.4f}")
+        
         self.model.train()
         return metrics
 
@@ -861,14 +737,6 @@ def main():
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed)
-    
-    # Demo mode adjustments
-    if args.demo_mode:
-        logger.info("Running in DEMO MODE")
-        args.max_steps = 100
-        args.stage1_steps = 20
-        args.batch_size = 2
-        args.num_workers = 0
     
     # Setup model
     model, model_config, converted_layers = setup_single_layer_model(args)
@@ -886,6 +754,15 @@ def main():
     
     # Setup data loaders
     logger.info("Setting up data loaders...")
+    if args.fixed_validation:
+        logger.info(f"Using fixed validation dataset with {args.num_validation_samples} samples")
+        logger.info(f"Validation batch size: {args.validation_batch_size}")
+        if args.validation_cache_file:
+            logger.info(f"Using cache file: {args.validation_cache_file}")
+    else:
+        logger.info("Using streaming validation dataset")
+    
+    # Create train loader using streamer
     streamer = MultiDatasetStreamer(
         preset=args.dataset_preset,
         tokenizer=tokenizer,
@@ -893,7 +770,45 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers
     )
-    train_loader, val_loader = streamer.create_data_loaders(validation=True)
+    
+    # Create train loader only first
+    train_loader, _ = streamer.create_data_loaders(
+        validation=False
+    )
+    
+    # Create validation loader separately with optimized settings
+    if args.fixed_validation:
+        from src.training.streaming_data import FixedValidationDataset
+        
+        # Auto-generate cache file name if not provided
+        if args.validation_cache_file is None:
+            cache_dir = Path(args.output_dir) / "cache" if args.output_dir else Path("cache")
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            args.validation_cache_file = str(cache_dir / f"val_cache_{args.dataset_preset}_{args.num_validation_samples}.pkl")
+        
+        val_dataset = FixedValidationDataset(
+            tokenizer=tokenizer,
+            dataset_name=streamer.dataset_names[0],
+            dataset_config=streamer.dataset_configs[0],
+            max_length=args.max_length,
+            num_samples=args.num_validation_samples,
+            seed=42,
+            cache_file=args.validation_cache_file
+        )
+        
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=args.validation_batch_size,  # Use larger batch size for validation
+            shuffle=False,
+            num_workers=0,  # No workers needed for cached data
+            pin_memory=torch.cuda.is_available()
+        )
+    else:
+        # Fallback to streaming validation
+        _, val_loader = streamer.create_data_loaders(
+            validation=True,
+            fixed_validation=False
+        )
     
     # Setup WandB
     if args.wandb_name is None:
@@ -919,8 +834,6 @@ def main():
     
     # Create training config
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    if args.demo_mode:
-        device = "cpu"
     
     training_config = TrainingConfig(
         model_name=args.model_name,
@@ -943,20 +856,12 @@ def main():
         device=device
     )
     
-    # Loss configuration based on mode
+    # Loss configuration
     loss_config = {
-        'loss_mode': args.loss_mode,
         'direct_mlp_weight': args.direct_mlp_weight,
         'fidelity_weight': args.fidelity_weight,
         'regularization_weight': args.lambda_reg,
     }
-    
-    # Add mode-specific parameters
-    if args.loss_mode == 'guided':
-        loss_config['attention_encoding_weight'] = args.attention_encoding_weight
-    elif args.loss_mode == 'staged':
-        loss_config['attention_encoding_weight'] = args.attention_encoding_weight
-        loss_config['stage1_steps'] = args.stage1_steps
     
     # Create specialized trainer
     logger.info("Initializing single-layer NPT trainer...")
@@ -966,12 +871,11 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         layer_idx=layer_idx,
-        stage1_steps=args.stage1_steps,
-        stage1_lr=args.stage1_lr,
         gradient_scale_factor=args.gradient_scale_factor,
         loss_config=loss_config,
         tracker=tracker,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        fixed_validation=args.fixed_validation
     )
     
     # Start training
@@ -983,12 +887,13 @@ def main():
     logger.info(f"  NPT Layer: {layer_idx}")
     logger.info(f"  NPT Rank: {args.np_rank} (effective: {model.model.layers[layer_idx].np_component.rank})")
     logger.info(f"  Num Ranks (rank-k): {args.num_ranks}")
-    logger.info(f"  Loss Mode: {args.loss_mode}")
-    if args.loss_mode == 'staged':
-        logger.info(f"  Stage 1 Steps: {args.stage1_steps}")
     logger.info(f"  Total Steps: {args.max_steps}")
     logger.info(f"  Gradient Scale Factor: {args.gradient_scale_factor}x")
     logger.info(f"  Direct MLP Weight: {args.direct_mlp_weight}")
+    logger.info(f"Validation:")
+    logger.info(f"  Type: {'Fixed' if args.fixed_validation else 'Streaming'}")
+    if args.fixed_validation:
+        logger.info(f"  Samples: {args.num_validation_samples}")
     logger.info(f"WandB Run: {tracker.run.name if tracker.run else 'disabled'}")
     logger.info(f"Output Directory: {training_config.output_dir}")
     logger.info("=" * 80 + "\n")
