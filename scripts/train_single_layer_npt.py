@@ -17,13 +17,9 @@ import argparse
 import sys
 from pathlib import Path
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import logging
 from datetime import datetime
-import json
 from typing import Optional, Dict, List, Tuple
-import numpy as np
 
 # Add src directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -37,14 +33,12 @@ from src.training.streaming_data import (
 )
 from src.training.wandb_integration import WandBTracker
 from src.training.single_layer_losses import (
-    SingleLayerEquivalenceLoss,
     DirectSupervisionLoss,
-    GuidedSupervisionLoss,
     GradientScaler,
     check_mode_collapse
 )
+from src.training.evaluation import create_fixed_evaluator
 from transformers import AutoTokenizer, LlamaConfig, AutoConfig
-import wandb
 
 # Setup logging
 logging.basicConfig(
@@ -114,48 +108,21 @@ def parse_args():
         help="Initialization strategy: improved (better gradient flow) or conservative (original)"
     )
     
-    # Loss configuration
-    parser.add_argument(
-        "--loss_mode",
-        type=str,
-        choices=["direct", "guided", "staged"],
-        default="direct",
-        help="Loss mode: direct (recommended), guided (with attention hint), staged (old behavior)"
-    )
-    
     # Loss weights
     parser.add_argument(
         "--direct_mlp_weight",
         type=float,
-        default=1.0,  # Changed default for direct mode
+        default=1.0,
         help="Weight for direct MLP supervision loss"
-    )
-    parser.add_argument(
-        "--attention_encoding_weight",
-        type=float,
-        default=1.0,  # Reduced default
-        help="Weight for attention encoding loss (only for guided/staged modes)"
     )
     parser.add_argument(
         "--fidelity_weight",
         type=float,
-        default=0.1,  # Reduced default for direct mode
+        default=0.1,
         help="Weight for final output fidelity loss"
     )
-    
-    # Training stages
-    parser.add_argument(
-        "--stage1_steps",
-        type=int,
-        default=1000,
-        help="Number of steps for attention reconstruction stage"
-    )
-    parser.add_argument(
-        "--stage1_lr",
-        type=float,
-        default=1e-3,
-        help="Learning rate for stage 1"
-    )
+
+    # Training configuration
     parser.add_argument(
         "--gradient_scale_factor",
         type=float,
@@ -318,6 +285,12 @@ def parse_args():
         help="Run in demo mode with small model and limited steps"
     )
     parser.add_argument(
+        "--num_eval_samples",
+        type=int,
+        default=1000,
+        help="Number of validation samples to use for evaluation"
+    )
+    parser.add_argument(
         "--load_npt_weights",
         type=str,
         default=None,
@@ -450,8 +423,8 @@ def setup_single_layer_model(args):
 
 
 class SingleLayerNPTTrainer(NPTTrainer):
-    """Specialized trainer for single-layer NPT with two-stage training."""
-    
+    """Specialized trainer for single-layer NPT with direct supervision."""
+
     def __init__(
         self,
         model,
@@ -459,58 +432,43 @@ class SingleLayerNPTTrainer(NPTTrainer):
         train_loader,
         val_loader,
         layer_idx,
-        stage1_steps=1000,
-        stage1_lr=1e-3,
         gradient_scale_factor=10.0,
         loss_config=None,
         tracker=None,
         tokenizer=None,
+        evaluator=None,
         **kwargs
     ):
         super().__init__(model, config, train_loader, val_loader, **kwargs)
-        
+
         self.layer_idx = layer_idx
-        self.stage1_steps = stage1_steps
-        self.stage1_lr = stage1_lr
         self.gradient_scale_factor = gradient_scale_factor
         self.tracker = tracker
         self.tokenizer = tokenizer
         self.device = config.device
-        
-        # Initialize appropriate loss function based on mode
-        loss_mode = loss_config.get('loss_mode', 'direct')
-        
-        if loss_mode == 'direct':
-            self.loss_fn = DirectSupervisionLoss(
-                direct_mlp_weight=loss_config.get('direct_mlp_weight', 1.0),
-                fidelity_weight=loss_config.get('fidelity_weight', 0.1),
-                regularization_weight=loss_config.get('regularization_weight', 0.001)
-            )
-        elif loss_mode == 'guided':
-            self.loss_fn = GuidedSupervisionLoss(
-                direct_mlp_weight=loss_config.get('direct_mlp_weight', 100.0),
-                attention_encoding_weight=loss_config.get('attention_encoding_weight', 1.0),
-                fidelity_weight=loss_config.get('fidelity_weight', 10.0),
-                regularization_weight=loss_config.get('regularization_weight', 0.001)
-            )
-        else:  # staged (old behavior)
-            self.loss_fn = SingleLayerEquivalenceLoss(**loss_config)
-        
+        self.evaluator = evaluator
+
+        # Initialize direct supervision loss
+        self.loss_fn = DirectSupervisionLoss(
+            direct_mlp_weight=loss_config.get('direct_mlp_weight', 1.0),
+            fidelity_weight=loss_config.get('fidelity_weight', 0.1),
+            regularization_weight=loss_config.get('regularization_weight', 0.001)
+        )
+
         # Initialize gradient scaler
         self.gradient_scaler = GradientScaler(scale_factor=gradient_scale_factor)
-        
+
         # Generation prompts
         self.generation_prompts = [
             "The future of artificial intelligence",
             "Once upon a time in a distant galaxy",
             "The key to understanding neural networks",
         ]
+
+        # Track best evaluation metrics
+        self.best_eval_loss = float('inf')
+        self.best_eval_step = 0
     
-    def get_lr(self):
-        """Get current learning rate based on training stage."""
-        if self.global_step < self.stage1_steps:
-            return self.stage1_lr
-        return self.config.learning_rate
     
     def collect_single_layer_outputs(self, input_ids):
         """
@@ -670,54 +628,68 @@ class SingleLayerNPTTrainer(NPTTrainer):
     def train_step(self, batch):
         """Training step with two-stage strategy."""
         self.model.train()
-        
+
         input_ids = batch['input_ids'].to(self.device)
-        
+
         # Collect outputs
         outputs = self.collect_single_layer_outputs(input_ids)
-        
+
         # Check for mode collapse
         if self.global_step % 100 == 0:
             if check_mode_collapse(outputs['v_a'], outputs['v_b']):
                 logger.warning(f"Mode collapse detected at step {self.global_step}")
-        
-        # Compute loss with stage-based weighting
-        loss_output = self.loss_fn(outputs, current_step=self.global_step)
-        loss = loss_output.total_loss
-        
-        # Zero gradients
-        self.optimizer.zero_grad()
+
+        # Compute loss with direct supervision
+        loss_output = self.loss_fn(outputs)
+        # Scale loss for gradient accumulation
+        loss = loss_output.total_loss / self.config.gradient_accumulation_steps
+
+        # Zero gradients at the start of accumulation
+        if self.batch_count % self.config.gradient_accumulation_steps == 0:
+            self.optimizer.zero_grad()
         
         # Backward pass
         if self.config.mixed_precision and self.scaler:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
-        
-        # Scale gradients for single NPT layer
-        self.gradient_scaler.scale_npt_gradients(self.model, [self.layer_idx])
-        
-        # Gradient clipping
-        if self.config.gradient_clip_value:
+
+        # Increment batch counter
+        self.batch_count += 1
+
+        # Only perform optimizer step after accumulating gradients
+        if self.batch_count % self.config.gradient_accumulation_steps == 0:
+            # Scale gradients for single NPT layer
+            self.gradient_scaler.scale_npt_gradients(self.model, [self.layer_idx])
+
+            # Gradient clipping
+            if self.config.gradient_clip_value:
+                if self.config.mixed_precision and self.scaler:
+                    self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.gradient_clip_value
+                )
+            else:
+                grad_norm = 0.0
+
+            # Optimizer step
             if self.config.mixed_precision and self.scaler:
-                self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.gradient_clip_value
-            )
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+
+            # Learning rate scheduler
+            if self.scheduler:
+                self.scheduler.step()
+
+            # Only increment global_step when optimizer steps
+            self.global_step += 1
+            step_taken = True
         else:
             grad_norm = 0.0
-        
-        # Optimizer step
-        if self.config.mixed_precision and self.scaler:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            self.optimizer.step()
-        
-        # Learning rate scheduler (adjust based on stage)
-        if self.scheduler and self.global_step >= self.stage1_steps:
-            self.scheduler.step()
+            step_taken = False
         
         # Create metrics
         from dataclasses import dataclass
@@ -726,7 +698,6 @@ class SingleLayerNPTTrainer(NPTTrainer):
             step: int
             total_loss: float
             direct_mlp_loss: float
-            attention_encoding_loss: float
             fidelity_loss: float
             regularization_loss: float
             learning_rate: float
@@ -735,52 +706,106 @@ class SingleLayerNPTTrainer(NPTTrainer):
             v_a_norm: float
             v_b_norm: float
             modulation_magnitude: float
-            stage: int
-        
-        # Get metrics from loss_output, which already contains the loss values
-        metrics = Metrics(
-            step=self.global_step,
-            total_loss=loss.item(),
-            direct_mlp_loss=loss_output.metrics['direct_mlp_loss'],
-            attention_encoding_loss=loss_output.metrics['attention_encoding_loss'],
-            fidelity_loss=loss_output.metrics['fidelity_loss'],
-            regularization_loss=loss_output.metrics['regularization_loss'],
-            learning_rate=self.get_lr(),
-            grad_norm=grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-            v_a_attention_similarity=loss_output.metrics['v_a_attention_similarity'],
-            v_a_norm=loss_output.metrics['v_a_norm'],
-            v_b_norm=loss_output.metrics['v_b_norm'],
-            modulation_magnitude=loss_output.metrics['modulation_magnitude'],
-            stage=loss_output.metrics['stage']
-        )
-        
-        # Log metrics
-        if self.tracker and self.global_step % self.config.logging_steps == 0:
-            self.tracker.log_metrics(vars(metrics), step=self.global_step)
-            
-            # Log stage transition (only for staged mode)
-            if hasattr(self.loss_fn, 'stage1_steps') and self.global_step == self.stage1_steps:
-                logger.info("=" * 80)
-                logger.info("STAGE TRANSITION: Moving from attention reconstruction to full equivalence")
-                logger.info(f"v_a attention similarity: {metrics.v_a_attention_similarity:.3f}")
-                logger.info(f"v_a norm: {metrics.v_a_norm:.3f}, v_b norm: {metrics.v_b_norm:.3f}")
-                logger.info("=" * 80)
-        
-        # Generate samples periodically
-        if (self.tokenizer and 
-            self.global_step % self.config.generation_steps == 0 and
-            self.global_step > 0):
-            self.generate_samples()
-        
-        self.global_step += 1
-        return metrics
+
+        # Only return metrics when optimizer step is taken
+        if step_taken:
+            # Get metrics from loss_output, which already contains the loss values
+            metrics = Metrics(
+                step=self.global_step,
+                total_loss=loss_output.total_loss.item(),  # Use unscaled loss for metrics
+                direct_mlp_loss=loss_output.metrics['direct_mlp_loss'],
+                fidelity_loss=loss_output.metrics['fidelity_loss'],
+                regularization_loss=loss_output.metrics['regularization_loss'],
+                learning_rate=self.optimizer.param_groups[0]['lr'],
+                grad_norm=grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
+                v_a_attention_similarity=loss_output.metrics['v_a_attention_similarity'],
+                v_a_norm=loss_output.metrics['v_a_norm'],
+                v_b_norm=loss_output.metrics['v_b_norm'],
+                modulation_magnitude=loss_output.metrics['modulation_magnitude'],
+            )
+
+            # Log metrics
+            if self.tracker and self.global_step % self.config.logging_steps == 0:
+                self.tracker.log_metrics(vars(metrics), step=self.global_step)
+
+            # Generate samples periodically
+            if (self.tokenizer and
+                self.global_step % self.config.generation_steps == 0 and
+                self.global_step > 0):
+                self.generate_samples()
+
+            # Run fixed evaluation periodically
+            if (self.evaluator and
+                self.global_step % self.config.eval_steps == 0 and
+                self.global_step > 0):
+                self.run_fixed_evaluation()
+
+            return metrics, True
+        else:
+            return None, False
     
+    def run_fixed_evaluation(self):
+        """Run evaluation on fixed dataset and log metrics."""
+        logger.info(f"Running fixed evaluation at step {self.global_step}")
+
+        # Run evaluation
+        eval_metrics = self.evaluator.evaluate_single_layer_npt(
+            model=self.model,
+            layer_idx=self.layer_idx,
+            loss_fn=self.loss_fn,
+            batch_size=4,
+            max_batches=50  # Limit for speed
+        )
+
+        # Check if this is the best model
+        if eval_metrics.loss < self.best_eval_loss:
+            self.best_eval_loss = eval_metrics.loss
+            self.best_eval_step = self.global_step
+            logger.info(f"New best evaluation loss: {self.best_eval_loss:.4f}")
+
+            # Save best model checkpoint
+            if self.config.output_dir:
+                best_path = Path(self.config.output_dir) / "checkpoints" / "best"
+                best_path.mkdir(parents=True, exist_ok=True)
+                self.model.save_npt_weights(best_path / "npt_weights.pt")
+                logger.info(f"Saved best model to {best_path}")
+
+        # Log to console
+        logger.info(
+            f"Eval metrics - Loss: {eval_metrics.loss:.4f}, "
+            f"Perplexity: {eval_metrics.perplexity:.2f}, "
+            f"Direct MLP: {eval_metrics.direct_mlp_loss:.4f}, "
+            f"Fidelity: {eval_metrics.fidelity_loss:.4f}"
+        )
+
+        # Log to WandB
+        if self.tracker:
+            eval_dict = {
+                'eval/loss': eval_metrics.loss,
+                'eval/perplexity': eval_metrics.perplexity,
+                'eval/direct_mlp_loss': eval_metrics.direct_mlp_loss,
+                'eval/fidelity_loss': eval_metrics.fidelity_loss,
+                'eval/regularization_loss': eval_metrics.regularization_loss,
+                'eval/best_loss': self.best_eval_loss,
+                'eval/best_step': self.best_eval_step,
+            }
+            self.tracker.log_metrics(eval_dict, step=self.global_step)
+
+        # Save metrics to file
+        if self.config.output_dir:
+            self.evaluator.save_metrics(
+                eval_metrics,
+                save_path=Path(self.config.output_dir) / "evaluation",
+                experiment_name=f"layer_{self.layer_idx}",
+                step=self.global_step
+            )
+
     def generate_samples(self):
         """Generate samples to monitor training progress."""
         self.model.eval()
-        
+
         print(f"\n{'='*80}")
-        print(f"Generating samples at step {self.global_step} (Stage {1 if self.global_step < self.stage1_steps else 2})")
+        print(f"Generating samples at step {self.global_step}")
         print(f"{'='*80}")
         
         for prompt in self.generation_prompts[:2]:
@@ -818,7 +843,6 @@ class SingleLayerNPTTrainer(NPTTrainer):
         
         total_loss = 0.0
         total_direct_mlp = 0.0
-        total_attention_encoding = 0.0
         total_fidelity = 0.0
         total_batches = 0
         
@@ -831,21 +855,19 @@ class SingleLayerNPTTrainer(NPTTrainer):
                 
                 # Collect outputs for single-layer evaluation
                 outputs = self.collect_single_layer_outputs(input_ids)
-                
+
                 # Compute loss using single-layer loss function
-                loss_output = self.loss_fn(outputs, current_step=self.global_step)
-                
+                loss_output = self.loss_fn(outputs)
+
                 total_loss += loss_output.total_loss.item()
                 total_direct_mlp += loss_output.direct_mlp_loss.item()
-                total_attention_encoding += loss_output.attention_encoding_loss.item()
                 total_fidelity += loss_output.fidelity_loss.item()
                 total_batches += 1
-        
+
         # Compute averages
         metrics = {
             'val_loss': total_loss / max(1, total_batches),
             'val_direct_mlp_loss': total_direct_mlp / max(1, total_batches),
-            'val_attention_encoding_loss': total_attention_encoding / max(1, total_batches),
             'val_fidelity_loss': total_fidelity / max(1, total_batches),
         }
         
@@ -866,7 +888,6 @@ def main():
     if args.demo_mode:
         logger.info("Running in DEMO MODE")
         args.max_steps = 100
-        args.stage1_steps = 20
         args.batch_size = 2
         args.num_workers = 0
     
@@ -906,7 +927,7 @@ def main():
     # Add tags
     if args.wandb_tags is None:
         args.wandb_tags = []
-    args.wandb_tags.extend(["single_layer", f"layer_{layer_idx}", "two_stage", "direct_supervision"])
+    args.wandb_tags.extend(["single_layer", f"layer_{layer_idx}", "direct_supervision"])
     
     tracker = WandBTracker(
         project=args.wandb_project,
@@ -943,21 +964,25 @@ def main():
         device=device
     )
     
-    # Loss configuration based on mode
+    # Loss configuration
     loss_config = {
-        'loss_mode': args.loss_mode,
         'direct_mlp_weight': args.direct_mlp_weight,
         'fidelity_weight': args.fidelity_weight,
         'regularization_weight': args.lambda_reg,
     }
-    
-    # Add mode-specific parameters
-    if args.loss_mode == 'guided':
-        loss_config['attention_encoding_weight'] = args.attention_encoding_weight
-    elif args.loss_mode == 'staged':
-        loss_config['attention_encoding_weight'] = args.attention_encoding_weight
-        loss_config['stage1_steps'] = args.stage1_steps
-    
+
+    # Create fixed evaluator
+    logger.info("Initializing fixed evaluator...")
+    evaluator = create_fixed_evaluator(
+        tokenizer=tokenizer,
+        config={
+            'max_length': args.max_length,
+            'num_eval_samples': args.num_eval_samples,  # Configurable validation set size
+            'seed': 42,  # Fixed seed for reproducibility
+            'device': device
+        }
+    )
+
     # Create specialized trainer
     logger.info("Initializing single-layer NPT trainer...")
     trainer = SingleLayerNPTTrainer(
@@ -966,12 +991,11 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         layer_idx=layer_idx,
-        stage1_steps=args.stage1_steps,
-        stage1_lr=args.stage1_lr,
         gradient_scale_factor=args.gradient_scale_factor,
         loss_config=loss_config,
         tracker=tracker,
-        tokenizer=tokenizer
+        tokenizer=tokenizer,
+        evaluator=evaluator
     )
     
     # Start training
@@ -983,12 +1007,10 @@ def main():
     logger.info(f"  NPT Layer: {layer_idx}")
     logger.info(f"  NPT Rank: {args.np_rank} (effective: {model.model.layers[layer_idx].np_component.rank})")
     logger.info(f"  Num Ranks (rank-k): {args.num_ranks}")
-    logger.info(f"  Loss Mode: {args.loss_mode}")
-    if args.loss_mode == 'staged':
-        logger.info(f"  Stage 1 Steps: {args.stage1_steps}")
     logger.info(f"  Total Steps: {args.max_steps}")
     logger.info(f"  Gradient Scale Factor: {args.gradient_scale_factor}x")
     logger.info(f"  Direct MLP Weight: {args.direct_mlp_weight}")
+    logger.info(f"  Fidelity Weight: {args.fidelity_weight}")
     logger.info(f"WandB Run: {tracker.run.name if tracker.run else 'disabled'}")
     logger.info(f"Output Directory: {training_config.output_dir}")
     logger.info("=" * 80 + "\n")

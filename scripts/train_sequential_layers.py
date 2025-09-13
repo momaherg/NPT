@@ -72,12 +72,6 @@ def parse_args():
         help="Training steps per layer"
     )
     parser.add_argument(
-        "--stage1_steps",
-        type=int,
-        default=500,
-        help="Stage 1 steps for each layer"
-    )
-    parser.add_argument(
         "--batch_size",
         type=int,
         default=2,
@@ -270,7 +264,6 @@ def train_single_layer(layer_idx, args, checkpoint_info):
         "--np_rank", str(args.np_rank),
         "--num_ranks", str(args.num_ranks),
         "--max_steps", str(args.steps_per_layer),
-        "--stage1_steps", str(args.stage1_steps),
         "--batch_size", str(args.batch_size),
         "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
         "--learning_rate", str(args.learning_rate),
@@ -282,7 +275,7 @@ def train_single_layer(layer_idx, args, checkpoint_info):
         "--wandb_mode", args.wandb_mode,
         "--wandb_tags", "sequential", f"layer_{layer_idx}",
         "--logging_steps", "10",
-        "--eval_steps", "500",
+        "--eval_steps", "250",  # More frequent evaluation for tracking
         "--save_steps", "1000",
         "--generation_steps", "500",
     ]
@@ -339,7 +332,6 @@ def main():
     if args.demo_mode:
         logger.info("Running in DEMO MODE")
         args.steps_per_layer = 100
-        args.stage1_steps = 20
         args.num_layers = 4  # Only train 4 layers in demo
     
     # Setup checkpoint directory
@@ -372,7 +364,6 @@ def main():
     logger.info(f"Model: {args.model_name} ({args.model_size})")
     logger.info(f"Layers to train: {layers_to_train}")
     logger.info(f"Steps per layer: {args.steps_per_layer}")
-    logger.info(f"Stage 1 steps: {args.stage1_steps}")
     logger.info(f"NPT Rank: {args.np_rank}")
     logger.info(f"Num Ranks (rank-k): {args.num_ranks}")
     logger.info(f"Checkpoint directory: {args.checkpoint_dir}")

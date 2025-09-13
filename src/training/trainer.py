@@ -142,6 +142,7 @@ class NPTTrainer:
         
         # Training state
         self.global_step = 0
+        self.batch_count = 0  # Track batches for gradient accumulation
         self.current_epoch = 0
         self.best_val_loss = float('inf')
         
@@ -196,15 +197,15 @@ class NPTTrainer:
         
         return LambdaLR(self.optimizer, lr_lambda)
     
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> TrainingMetrics:
+    def train_step(self, batch: Dict[str, torch.Tensor]) -> Tuple[Optional[TrainingMetrics], bool]:
         """
         Perform one training step.
-        
+
         Args:
             batch: Batch of data
-        
+
         Returns:
-            Training metrics for this step
+            Tuple of (metrics, step_taken) where metrics is None if no optimizer step was taken
         """
         self.model.train()
         start_time = time.time()
@@ -234,15 +235,18 @@ class NPTTrainer:
         
         # Scale loss for gradient accumulation
         loss = loss_output.total_loss / self.config.gradient_accumulation_steps
-        
+
         # Backward pass
         if self.scaler is not None:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
-        
+
+        # Increment batch counter
+        self.batch_count += 1
+
         # Gradient clipping and optimizer step
-        if (self.global_step + 1) % self.config.gradient_accumulation_steps == 0:
+        if self.batch_count % self.config.gradient_accumulation_steps == 0:
             # Unscale gradients if using mixed precision
             if self.scaler is not None:
                 self.scaler.unscale_(self.optimizer)
@@ -267,27 +271,31 @@ class NPTTrainer:
             # Scheduler step
             if self.scheduler is not None:
                 self.scheduler.step()
+
+            # Only increment global_step when optimizer steps
+            self.global_step += 1
+
+            # Compute metrics after optimizer step
+            time_per_step = time.time() - start_time
+            current_lr = self.optimizer.param_groups[0]['lr']
+
+            metrics = TrainingMetrics(
+                step=self.global_step,
+                epoch=self.current_epoch,
+                total_loss=loss_output.total_loss.item(),
+                fidelity_loss=loss_output.fidelity_loss.item(),
+                regularization_loss=loss_output.regularization_loss.item(),
+                learning_rate=current_lr,
+                grad_norm=grad_norm,
+                avg_v_a_norm=loss_output.metrics['avg_v_a_norm'],
+                avg_v_b_norm=loss_output.metrics['avg_v_b_norm'],
+                time_per_step=time_per_step
+            )
+
+            return metrics, True
         else:
-            grad_norm = 0.0
-        
-        # Compute metrics
-        time_per_step = time.time() - start_time
-        current_lr = self.optimizer.param_groups[0]['lr']
-        
-        metrics = TrainingMetrics(
-            step=self.global_step,
-            epoch=self.current_epoch,
-            total_loss=loss_output.total_loss.item(),
-            fidelity_loss=loss_output.fidelity_loss.item(),
-            regularization_loss=loss_output.regularization_loss.item(),
-            learning_rate=current_lr,
-            grad_norm=grad_norm,
-            avg_v_a_norm=loss_output.metrics['avg_v_a_norm'],
-            avg_v_b_norm=loss_output.metrics['avg_v_b_norm'],
-            time_per_step=time_per_step
-        )
-        
-        return metrics
+            # No optimizer step taken - return None for metrics
+            return None, False
     
     def _compute_grad_norm(self) -> float:
         """Compute gradient norm for NP parameters."""
@@ -408,6 +416,7 @@ class NPTTrainer:
         # Save training state
         training_state = {
             'global_step': self.global_step,
+            'batch_count': self.batch_count,
             'current_epoch': self.current_epoch,
             'best_val_loss': self.best_val_loss,
             'optimizer_state_dict': self.optimizer.state_dict(),
@@ -435,6 +444,7 @@ class NPTTrainer:
         training_state = torch.load(checkpoint_path / "training_state.pt")
         
         self.global_step = training_state['global_step']
+        self.batch_count = training_state.get('batch_count', 0)  # Backward compatibility
         self.current_epoch = training_state['current_epoch']
         self.best_val_loss = training_state['best_val_loss']
         
@@ -470,38 +480,38 @@ class NPTTrainer:
         while self.global_step < self.config.max_steps:
             for batch in self.train_loader:
                 # Train step
-                metrics = self.train_step(batch)
-                
-                # Update progress
-                self.global_step += 1
-                pbar.update(1)
-                
-                # Log metrics
-                if self.global_step % self.config.logging_steps == 0:
-                    self._log_metrics(metrics)
-                    pbar.set_postfix({
-                        'loss': f"{metrics.total_loss:.4f}",
-                        'fidelity': f"{metrics.fidelity_loss:.4f}",
-                        'lr': f"{metrics.learning_rate:.2e}"
-                    })
-                
-                # Evaluate
-                if self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
-                    eval_metrics = self.evaluate()
-                    self._log_metrics(eval_metrics)
-                    
-                    # Save best model
-                    if eval_metrics.get('val_loss', float('inf')) < self.best_val_loss:
-                        self.best_val_loss = eval_metrics['val_loss']
-                        self.save_checkpoint('best')
-                
-                # Save checkpoint
-                if self.config.save_steps > 0 and self.global_step % self.config.save_steps == 0:
-                    self.save_checkpoint()
-                
-                # Check if done
-                if self.global_step >= self.config.max_steps:
-                    break
+                metrics, step_taken = self.train_step(batch)
+
+                # Only update progress and log if optimizer stepped
+                if step_taken:
+                    pbar.update(1)
+
+                    # Log metrics
+                    if self.global_step % self.config.logging_steps == 0:
+                        self._log_metrics(metrics)
+                        pbar.set_postfix({
+                            'loss': f"{metrics.total_loss:.4f}",
+                            'fidelity': f"{metrics.fidelity_loss:.4f}",
+                            'lr': f"{metrics.learning_rate:.2e}"
+                        })
+
+                    # Evaluate
+                    if self.config.eval_steps > 0 and self.global_step % self.config.eval_steps == 0:
+                        eval_metrics = self.evaluate()
+                        self._log_metrics(eval_metrics)
+
+                        # Save best model
+                        if eval_metrics.get('val_loss', float('inf')) < self.best_val_loss:
+                            self.best_val_loss = eval_metrics['val_loss']
+                            self.save_checkpoint('best')
+
+                    # Save checkpoint
+                    if self.config.save_steps > 0 and self.global_step % self.config.save_steps == 0:
+                        self.save_checkpoint()
+
+                    # Check if done
+                    if self.global_step >= self.config.max_steps:
+                        break
             
             # Update epoch
             self.current_epoch += 1

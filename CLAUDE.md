@@ -10,7 +10,7 @@ Neuro-Plastic Transformer (NPT) - A novel architecture that replaces standard ad
 
 **Current Implementation Status**:
 - ✅ Core NPT architecture (NPComponent, NPTDecoderLayer, NPTLlamaModel)
-- ✅ Sequential layer-by-layer training with two-stage strategy
+- ✅ Sequential layer-by-layer training with direct supervision
 - ✅ Selective layer loading (choose which layers operate in NPT mode)
 - ✅ Interactive knowledge injection with multi-layer support
 - ✅ Context transfer experiments (single and multi-layer)
@@ -58,9 +58,9 @@ pip install -r requirements.txt
 pytest tests/ -v
 
 # Run specific test modules
-pytest tests/test_np_component.py -v          # Stage 1 tests
-pytest tests/test_npt_decoder_layer.py -v     # Stage 2 tests  
-pytest tests/test_npt_model.py -v             # Stage 3 tests
+pytest tests/test_np_component.py -v          # NP Component tests
+pytest tests/test_npt_decoder_layer.py -v     # NPT Decoder Layer tests
+pytest tests/test_npt_model.py -v             # NPT Model tests
 
 # Run single test
 pytest tests/test_npt_model.py::TestNPTModel::test_forward_pass -xvs
@@ -68,10 +68,10 @@ pytest tests/test_npt_model.py::TestNPTModel::test_forward_pass -xvs
 # Run with coverage
 pytest tests/ --cov=src/npt --cov-report=term-missing
 
-# Demo scripts for each stage
-python scripts/demo_np_component.py       # Stage 1: NP Component
-python scripts/demo_npt_decoder_layer.py  # Stage 2: NPT Decoder Layer
-python scripts/demo_npt_model.py          # Stage 3: Hybrid Model
+# Demo scripts
+python scripts/demo_np_component.py       # NP Component demo
+python scripts/demo_npt_decoder_layer.py  # NPT Decoder Layer demo
+python scripts/demo_npt_model.py          # Hybrid Model demo
 ```
 
 ## Model Configuration
@@ -171,7 +171,6 @@ python scripts/train_sequential_layers.py \
   --model_size 8b \
   --layers "all"  # or "15,16,17" or "upper_half"
   --steps_per_layer 2000 \
-  --stage1_steps 500 \
   --batch_size 2 \
   --np_rank 256 \
   --wandb_project "npt-sequential"
@@ -184,13 +183,12 @@ python scripts/train_sequential_layers.py \
 
 ### Single-Layer Specialized Training
 ```bash
-# Train single NPT layer with two-stage strategy
+# Train single NPT layer with direct supervision
 python scripts/train_single_layer_npt.py \
   --model_name "meta-llama/Llama-3.2-1B" \
   --convert_layers 15 \
   --single_layer_mode \
-  --np_rank 256 \
-  --stage1_steps 1000  # Attention reconstruction stage
+  --np_rank 256
   --max_steps 30000 \
   --direct_mlp_weight 10.0 \
   --gradient_scale_factor 10.0
@@ -242,18 +240,12 @@ The project uses a layer-by-layer sequential training strategy where each NPT la
 - Accumulates learned weights progressively
 - Enables better convergence for single-layer transformations
 
-### Single-Layer Two-Stage Training
-Each NPT layer undergoes specialized two-stage training:
-
-**Stage 1: Attention Reconstruction (steps 0-1000)**
-- Focus on training v_a to encode attention information
-- High weight on attention encoding loss (80%)
-- Minimal direct MLP supervision (10%)
-
-**Stage 2: Full Equivalence (steps 1000+)**
-- Train complete NPT transformation
-- Direct MLP supervision becomes dominant (10x weight)
-- Target: MLP_modulated(h) = attention + MLP(h + attention)
+### Single-Layer Direct Supervision Training
+Each NPT layer uses direct supervision to learn the transformation:
+- **Objective**: MLP_modulated(h) = attention + MLP(h + attention)
+- Model learns to encode attention in v_a naturally through gradient descent
+- No explicit attention encoding loss - emerges from direct supervision
+- 10x gradient scaling for single-layer training
 
 ### Loss Functions
 
@@ -380,11 +372,11 @@ Single NPT layers use 10x gradient scaling during training to compensate for lea
 │   ├── interactive_knowledge_injection.py  # Knowledge editing with selective layers
 │   ├── npt_context_transfer.py     # Single-layer context transfer
 │   ├── npt_multi_layer_context_transfer.py # Multi-layer context transfer
-│   └── demo_*.py         # Stage-wise demos
+│   └── demo_*.py         # Component demos
 ├── tests/                # Test suite
-│   ├── test_np_component.py    # Stage 1 tests
-│   ├── test_npt_decoder_layer.py  # Stage 2 tests
-│   └── test_npt_model.py       # Stage 3 tests
+│   ├── test_np_component.py    # NP Component tests
+│   ├── test_npt_decoder_layer.py  # NPT Decoder Layer tests
+│   └── test_npt_model.py       # NPT Model tests
 ├── docs/                 # Documentation
 │   └── selective_npt_layers.md # Selective layer loading guide
 └── config/               # Configuration files

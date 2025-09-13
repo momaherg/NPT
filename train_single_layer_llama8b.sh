@@ -10,7 +10,6 @@ echo "=================================================="
 python scripts/train_single_layer_npt.py \
   --model_name "meta-llama/Llama-3.1-8B-Instruct" \
   --model_size 8b \
-  --loss_mode direct \
   --learning_rate 1e-3 \
   --init_strategy improved \
   --convert_layers "15" \
@@ -19,13 +18,12 @@ python scripts/train_single_layer_npt.py \
   --np_rank 256 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
-  --batch_size 1 \
-  --gradient_accumulation_steps 64 \
+  --batch_size 4 \
+  --gradient_accumulation_steps 1 \
   --learning_rate 5e-4 \
   --weight_decay 0.01 \
   --lambda_reg 0.01 \
   --direct_mlp_weight 10.0 \
-  --attention_encoding_weight 5.0 \
   --fidelity_weight 1.0 \
   --gradient_scale_factor 10.0 \
   --max_steps 30000 \
@@ -33,7 +31,8 @@ python scripts/train_single_layer_npt.py \
   --gradient_clip 0.5 \
   --mixed_precision \
   --logging_steps 10 \
-  --eval_steps 500 \
+  --eval_steps 50 \
+  --num_eval_samples 20 \
   --save_steps 1000 \
   --generation_steps 500 \
   --num_workers 1 \
