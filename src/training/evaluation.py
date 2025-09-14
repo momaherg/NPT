@@ -431,7 +431,7 @@ class FixedEvaluator:
 
         # Get modulated MLP output
         mlp_input = npt_layer.post_attention_layernorm(residual)
-        mlp_modulated = npt_layer._apply_modulated_mlp_efficient(mlp_input, v_a, v_b)
+        mlp_modulated = npt_layer._apply_modulated_mlp(mlp_input, v_a, v_b)
 
         # Continue through remaining layers
         hidden_states = residual + mlp_modulated

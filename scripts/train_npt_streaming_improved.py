@@ -561,23 +561,24 @@ class ImprovedNPTTrainer(NPTTrainer):
     def train_step(self, batch):
         """Training step with improved loss."""
         self.model.train()
-        
+
         # Progressive unfreezing
         if self.progressive_unfreezer:
             self.progressive_unfreezer.update(self.global_step)
-        
+
         input_ids = batch['input_ids'].to(self.device)
         attention_mask = batch.get('attention_mask')
         if attention_mask is not None:
             attention_mask = attention_mask.to(self.device)
-        
-        # Zero gradients
-        self.optimizer.zero_grad()
-        
+
+        # Zero gradients only at the start of accumulation cycle
+        if self.batch_count % self.config.gradient_accumulation_steps == 0:
+            self.optimizer.zero_grad()
+
         if self.use_improved_loss:
             # Collect layer-wise outputs
             outputs = self.collect_layer_outputs(input_ids, attention_mask)
-            
+
             # Compute improved loss
             loss_output = self.loss_fn(
                 npt_outputs=outputs['npt_outputs'],
@@ -586,10 +587,11 @@ class ImprovedNPTTrainer(NPTTrainer):
                 v_b_list=outputs['v_b_list'],
                 current_step=self.global_step
             )
-            
-            loss = loss_output.total_loss
-            
-            # Create metrics
+
+            # Scale loss for gradient accumulation
+            loss = loss_output.total_loss / self.config.gradient_accumulation_steps
+
+            # Create metrics (but filled in only when optimizer steps)
             from dataclasses import dataclass
             @dataclass
             class Metrics:
@@ -599,126 +601,168 @@ class ImprovedNPTTrainer(NPTTrainer):
                 regularization_loss: float
                 learning_rate: float
                 grad_norm: float = 0.0
-                
-            metrics = Metrics(
-                step=self.global_step,
-                total_loss=loss.item(),
-                fidelity_loss=loss_output.fidelity_loss.item(),
-                regularization_loss=loss_output.regularization_loss.item(),
-                learning_rate=self.get_lr()
-            )
-            
-            # Add additional metrics
-            for key, value in loss_output.metrics.items():
-                setattr(metrics, key, value)
+
+            # Store raw loss values for metrics (unscaled)
+            raw_loss_values = {
+                'total_loss': loss_output.total_loss.item(),
+                'fidelity_loss': loss_output.fidelity_loss.item(),
+                'regularization_loss': loss_output.regularization_loss.item(),
+                'metrics': loss_output.metrics
+            }
         else:
-            # Use standard loss (fallback)
-            metrics = super().train_step(batch)
-            loss = metrics.total_loss
-        
+            # Use standard loss (fallback) - delegate to parent
+            parent_result = super().train_step(batch)
+            if parent_result[1]:  # If parent took a step
+                return parent_result
+            else:
+                # Parent didn't step, we handle accumulation
+                loss = parent_result[0].total_loss / self.config.gradient_accumulation_steps if parent_result[0] else None
+                raw_loss_values = None
+
         # Backward pass
         if self.config.mixed_precision and self.scaler:
             self.scaler.scale(loss).backward()
         else:
             loss.backward()
-        
-        # Gradient monitoring and clipping
-        if self.gradient_monitor:
-            self.gradient_monitor.clip_and_monitor()
-            grad_stats = self.gradient_monitor.get_stats()
-            for key, value in grad_stats.items():
-                setattr(metrics, f"grad_{key}", value)
-        
-        # Compute gradient norm
-        if self.config.gradient_clip_value:
-            if self.config.mixed_precision and self.scaler:
-                self.scaler.unscale_(self.optimizer)
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.gradient_clip_value
-            )
-            metrics.grad_norm = grad_norm.item()
-        
-        # Update gradient scale for loss
-        if self.use_improved_loss and hasattr(self.loss_fn, 'update_gradient_scale'):
-            self.loss_fn.update_gradient_scale(metrics.grad_norm)
-        
-        # Optimizer step
-        if self.config.mixed_precision and self.scaler:
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            self.optimizer.step()
-        
-        # Learning rate scheduler
-        if self.scheduler:
-            self.scheduler.step()
-        
-        # WandB logging
-        if self.tracker and self.global_step % self.config.logging_steps == 0:
-            self.tracker.log_metrics(vars(metrics), step=self.global_step)
-            
-            # Log gradients and weights periodically
-            if self.global_step % (self.config.logging_steps * 10) == 0:
-                self.tracker.log_gradients(self.model, step=self.global_step)
-                self.tracker.log_weights(self.model, step=self.global_step)
-        
-        # Generate samples periodically
-        if (self.tokenizer and 
-            self.global_step % self.config.generation_steps == 0 and
-            self.global_step > 0):
-            
-            # Generate samples
-            self.model.eval()
-            generated_samples = []
-            
-            print(f"\n{'='*80}")
-            print(f"Generating samples at step {self.global_step}")
-            print(f"{'='*80}")
-            
-            for prompt in self.generation_prompts[:2]:  # Use first 2 prompts for terminal
-                # Tokenize prompt
-                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=50)
-                input_ids = inputs.input_ids.to(self.device)
-                
-                # Generate with NPT model
-                with torch.no_grad():
-                    outputs = self.model.generate(
-                        input_ids,
-                        max_length=50,
-                        temperature=0.8,
-                        do_sample=True,
-                        top_p=0.9,
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
-                    )
-                
-                generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-                generated_samples.append({
-                    'prompt': prompt,
-                    'generated': generated_text
-                })
-                
-                # Print to terminal
-                print(f"\nPrompt: {prompt}")
-                print(f"Generated: {generated_text}")
-            
-            print(f"{'='*80}\n")
-            
-            # Log to WandB if available
-            if self.tracker:
-                self.tracker.log_sample_outputs(
-                    self.model,
-                    self.tokenizer,
-                    self.generation_prompts,
-                    step=self.global_step,
-                    max_length=50
+
+        # Increment batch counter
+        self.batch_count += 1
+
+        # Only perform optimizer step after accumulating gradients
+        if self.batch_count % self.config.gradient_accumulation_steps == 0:
+            # Gradient monitoring and clipping
+            grad_norm = 0.0
+            if self.gradient_monitor:
+                self.gradient_monitor.clip_and_monitor()
+                grad_stats = self.gradient_monitor.get_stats()
+
+            # Compute gradient norm and clip
+            if self.config.gradient_clip_value:
+                if self.config.mixed_precision and self.scaler:
+                    self.scaler.unscale_(self.optimizer)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.config.gradient_clip_value
                 )
-            
-            self.model.train()
-        
-        self.global_step += 1
-        return metrics
+                grad_norm = grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm
+
+            # Update gradient scale for loss
+            if self.use_improved_loss and hasattr(self.loss_fn, 'update_gradient_scale'):
+                self.loss_fn.update_gradient_scale(grad_norm)
+
+            # Optimizer step
+            if self.config.mixed_precision and self.scaler:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+
+            # Learning rate scheduler
+            if self.scheduler:
+                self.scheduler.step()
+
+            # Increment global step only when optimizer steps
+            self.global_step += 1
+
+            # Create metrics only when we take a step
+            if raw_loss_values:
+                metrics = Metrics(
+                    step=self.global_step,
+                    total_loss=raw_loss_values['total_loss'],
+                    fidelity_loss=raw_loss_values['fidelity_loss'],
+                    regularization_loss=raw_loss_values['regularization_loss'],
+                    learning_rate=self.get_lr(),
+                    grad_norm=grad_norm
+                )
+
+                # Add additional metrics
+                for key, value in raw_loss_values['metrics'].items():
+                    setattr(metrics, key, value)
+
+                # Add gradient stats if available
+                if self.gradient_monitor:
+                    grad_stats = self.gradient_monitor.get_stats()
+                    for key, value in grad_stats.items():
+                        setattr(metrics, f"grad_{key}", value)
+            else:
+                # Fallback metrics
+                metrics = Metrics(
+                    step=self.global_step,
+                    total_loss=0.0,
+                    fidelity_loss=0.0,
+                    regularization_loss=0.0,
+                    learning_rate=self.get_lr(),
+                    grad_norm=grad_norm
+                )
+
+            # WandB logging (only when we take a step)
+            if self.tracker and self.global_step % self.config.logging_steps == 0:
+                self.tracker.log_metrics(vars(metrics), step=self.global_step)
+
+                # Log gradients and weights periodically
+                if self.global_step % (self.config.logging_steps * 10) == 0:
+                    self.tracker.log_gradients(self.model, step=self.global_step)
+                    self.tracker.log_weights(self.model, step=self.global_step)
+
+            # Generate samples periodically (only when we take a step)
+            if (self.tokenizer and
+                self.global_step % self.config.generation_steps == 0 and
+                self.global_step > 0):
+
+                # Generate samples
+                self.model.eval()
+                generated_samples = []
+
+                print(f"\n{'='*80}")
+                print(f"Generating samples at step {self.global_step}")
+                print(f"{'='*80}")
+
+                for prompt in self.generation_prompts[:2]:  # Use first 2 prompts for terminal
+                    # Tokenize prompt
+                    inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=50)
+                    input_ids = inputs.input_ids.to(self.device)
+
+                    # Generate with NPT model
+                    with torch.no_grad():
+                        outputs = self.model.generate(
+                            input_ids,
+                            max_length=50,
+                            temperature=0.8,
+                            do_sample=True,
+                            top_p=0.9,
+                            pad_token_id=self.tokenizer.pad_token_id,
+                            eos_token_id=self.tokenizer.eos_token_id,
+                        )
+
+                    generated_text = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                    generated_samples.append({
+                        'prompt': prompt,
+                        'generated': generated_text
+                    })
+
+                    # Print to terminal
+                    print(f"\nPrompt: {prompt}")
+                    print(f"Generated: {generated_text}")
+
+                print(f"{'='*80}\n")
+
+                # Log to WandB if available
+                if self.tracker:
+                    self.tracker.log_sample_outputs(
+                        self.model,
+                        self.tokenizer,
+                        self.generation_prompts,
+                        step=self.global_step,
+                        max_length=50
+                    )
+
+                self.model.train()
+
+            # Return metrics and indicate that we took a step
+            return metrics, True
+        else:
+            # No optimizer step taken - return None for metrics
+            return None, False
     
     def evaluate(self, eval_loader=None):
         """Override evaluate to handle improved loss properly."""

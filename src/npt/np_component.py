@@ -36,8 +36,9 @@ class NPComponent(nn.Module):
         num_ranks: int = 1,  # NEW: number of rank-1 components for rank-k updates
         init_strategy: str = "improved",  # NEW: "improved" or "conservative"
     ):
+        print(f"      [NPComponent] Initializing with d_model={d_model}, d_ffn={d_ffn}, rank={rank}, num_ranks={num_ranks}")
         super().__init__()
-        
+
         self.d_model = d_model
         self.d_ffn = d_ffn
         self.single_layer_mode = single_layer_mode
@@ -78,7 +79,7 @@ class NPComponent(nn.Module):
                 nn.Parameter(torch.empty(self.rank, d_ffn))
                 for _ in range(num_ranks)
             ])
-        
+
         # Initialize weights
         self._initialize_weights()
     
@@ -146,42 +147,56 @@ class NPComponent(nn.Module):
                 if self.single_layer_mode and i == 0:
                     # First component gets special attention-encoding initialization
                     nn.init.xavier_uniform_(self.W_down[i])
-                    
+
                     # Identity-like for first W_a_up based on strategy
                     if self.init_strategy == "improved":
+                        # Optimize eye matrix creation for large dimensions
                         if self.rank <= self.d_model:
-                            eye = torch.eye(self.rank, self.d_model)
-                            self.W_a_up[i].data = eye[:self.rank, :self.d_model] * 1.0
+                            # Create identity-like matrix more efficiently
+                            self.W_a_up[i].data.zero_()
+                            min_dim = min(self.rank, self.d_model)
+                            self.W_a_up[i].data[:min_dim, :min_dim].fill_diagonal_(1.0)
                             self.W_a_up[i].data += torch.randn(self.rank, self.d_model) * 0.1
                         else:
-                            num_repeats = (self.rank + self.d_model - 1) // self.d_model
-                            eye = torch.eye(self.d_model)
-                            repeated = eye.repeat(num_repeats, 1)[:self.rank, :]
-                            self.W_a_up[i].data = repeated * 1.0
+                            # For rank > d_model, use repeated pattern
+                            self.W_a_up[i].data.zero_()
+                            for offset in range(0, self.rank, self.d_model):
+                                end = min(offset + self.d_model, self.rank)
+                                size = end - offset
+                                self.W_a_up[i].data[offset:end, :size].fill_diagonal_(1.0)
                             self.W_a_up[i].data += torch.randn(self.rank, self.d_model) * 0.1
                         
                         std = (2.0 / (self.rank + self.d_ffn)) ** 0.5
                         nn.init.normal_(self.W_b_up[i], mean=0.0, std=std * 0.1)
                     else:
-                        # Conservative initialization
+                        # Conservative initialization - also optimized
                         if self.rank <= self.d_model:
-                            eye = torch.eye(self.rank, self.d_model)
-                            self.W_a_up[i].data = eye[:self.rank, :self.d_model] * 0.3
+                            self.W_a_up[i].data.zero_()
+                            min_dim = min(self.rank, self.d_model)
+                            self.W_a_up[i].data[:min_dim, :min_dim].fill_diagonal_(0.3)
                             self.W_a_up[i].data += torch.randn(self.rank, self.d_model) * 0.01
                         else:
-                            num_repeats = (self.rank + self.d_model - 1) // self.d_model
-                            eye = torch.eye(self.d_model)
-                            repeated = eye.repeat(num_repeats, 1)[:self.rank, :]
-                            self.W_a_up[i].data = repeated * 0.3
+                            self.W_a_up[i].data.zero_()
+                            for offset in range(0, self.rank, self.d_model):
+                                end = min(offset + self.d_model, self.rank)
+                                size = end - offset
+                                self.W_a_up[i].data[offset:end, :size].fill_diagonal_(0.3)
                             self.W_a_up[i].data += torch.randn(self.rank, self.d_model) * 0.01
                         
                         nn.init.uniform_(self.W_b_up[i], -self.init_scale, self.init_scale)
                 else:
                     # Other components get diverse initialization
                     nn.init.xavier_uniform_(self.W_down[i])
-                    
-                    # Use orthogonal initialization for diversity across components
-                    if i > 0:
+
+                    # For many components, use efficient random initialization with different seeds
+                    if self.num_ranks > 16:
+                        # For large num_ranks, avoid expensive orthogonal initialization
+                        # Use random initialization with different patterns for diversity
+                        torch.manual_seed(42 + i * 1337)  # Different seed per component
+                        nn.init.normal_(self.W_a_up[i], mean=0.0, std=self.init_scale)
+                        nn.init.normal_(self.W_b_up[i], mean=0.0, std=self.init_scale * 0.1)
+                    elif i > 0:
+                        # Use orthogonal initialization only for small num_ranks
                         # Orthogonal to encourage different representations
                         nn.init.orthogonal_(self.W_a_up[i], gain=self.init_scale)
                         nn.init.orthogonal_(self.W_b_up[i], gain=self.init_scale * 0.1)
@@ -221,21 +236,45 @@ class NPComponent(nn.Module):
             return v_a, v_b
         else:
             # Rank-k implementation: generate multiple rank-1 components
-            v_a_list = []
-            v_b_list = []
-            
-            for i in range(self.num_ranks):
-                # Each component has its own bottleneck
-                intermediate_r = attn_output @ self.W_down[i]
-                v_a_i = intermediate_r @ self.W_a_up[i]
-                v_b_i = intermediate_r @ self.W_b_up[i]
-                
-                v_a_list.append(v_a_i)
-                v_b_list.append(v_b_i)
-            
-            # Stack along a new dimension for rank-k representation
-            v_a = torch.stack(v_a_list, dim=2)  # (batch, seq, num_ranks, d_model)
-            v_b = torch.stack(v_b_list, dim=2)  # (batch, seq, num_ranks, d_ffn)
+            if self.num_ranks > 16:
+                # For many components, batch the operations for efficiency using einsum
+                # Stack all weight matrices
+                W_down_stacked = torch.stack([w for w in self.W_down], dim=0)  # (num_ranks, d_model, rank)
+                W_a_up_stacked = torch.stack([w for w in self.W_a_up], dim=0)  # (num_ranks, rank, d_model)
+                W_b_up_stacked = torch.stack([w for w in self.W_b_up], dim=0)  # (num_ranks, rank, d_ffn)
+
+                # Use einsum for efficient batched matrix multiplication
+                # attn_output: (batch, seq, d_model)
+                # W_down_stacked: (num_ranks, d_model, rank)
+                # intermediate_r: (batch, seq, num_ranks, rank)
+                intermediate_r = torch.einsum('bsd,ndr->bsnr', attn_output, W_down_stacked)
+
+                # intermediate_r: (batch, seq, num_ranks, rank)
+                # W_a_up_stacked: (num_ranks, rank, d_model)
+                # v_a: (batch, seq, num_ranks, d_model)
+                v_a = torch.einsum('bsnr,nrd->bsnd', intermediate_r, W_a_up_stacked)
+
+                # intermediate_r: (batch, seq, num_ranks, rank)
+                # W_b_up_stacked: (num_ranks, rank, d_ffn)
+                # v_b: (batch, seq, num_ranks, d_ffn)
+                v_b = torch.einsum('bsnr,nrf->bsnf', intermediate_r, W_b_up_stacked)
+            else:
+                # For small num_ranks, use original loop implementation
+                v_a_list = []
+                v_b_list = []
+
+                for i in range(self.num_ranks):
+                    # Each component has its own bottleneck
+                    intermediate_r = attn_output @ self.W_down[i]
+                    v_a_i = intermediate_r @ self.W_a_up[i]
+                    v_b_i = intermediate_r @ self.W_b_up[i]
+
+                    v_a_list.append(v_a_i)
+                    v_b_list.append(v_b_i)
+
+                # Stack along a new dimension for rank-k representation
+                v_a = torch.stack(v_a_list, dim=2)  # (batch, seq, num_ranks, d_model)
+                v_b = torch.stack(v_b_list, dim=2)  # (batch, seq, num_ranks, d_ffn)
             
             return v_a, v_b
     

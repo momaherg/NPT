@@ -184,29 +184,29 @@ class NPTLlamaModel(LlamaForCausalLM):
     def _convert_layer(self, layer_idx: int):
         """
         Convert a single layer to NPT layer.
-        
+
         Args:
             layer_idx: Index of the layer to convert
         """
         # Get the original layer
         original_layer = self.model.layers[layer_idx]
-        
+
         # Store reference to original layer
         self.original_layers[layer_idx] = original_layer
-        
+
         # Create NPT layer
         npt_layer = NPTDecoderLayer(self.config, layer_idx)
-        
+
         # Copy weights from original layer to NPT layer
         # The NPT layer inherits from LlamaDecoderLayer, so state dict should be compatible
         # We need to handle the fact that NPT layer has additional NP component parameters
         original_state = original_layer.state_dict()
         npt_layer.load_state_dict(original_state, strict=False)
-        
+
         # Replace the layer in the model
         self.model.layers[layer_idx] = npt_layer
         self.npt_layers[layer_idx] = npt_layer
-        
+
         # Set NPT mode to True by default
         npt_layer.set_npt_mode(True)
     

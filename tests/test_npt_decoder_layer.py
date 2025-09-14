@@ -174,9 +174,9 @@ class TestNPTDecoderLayer:
         v_a = torch.randn(batch_size, seq_len, config_small.hidden_size)
         v_b = torch.randn(batch_size, seq_len, config_small.intermediate_size)
         
-        # Test the efficient implementation
+        # Test the modulated MLP implementation
         with torch.no_grad():
-            output = layer._apply_modulated_mlp_efficient(hidden_states, v_a, v_b)
+            output = layer._apply_modulated_mlp(hidden_states, v_a, v_b)
         
         # Check output has correct shape
         assert output.shape == (batch_size, seq_len, config_small.hidden_size)

@@ -39,16 +39,16 @@ class NPTDecoderLayer(LlamaDecoderLayer):
     def __init__(self, config, layer_idx: int = None):
         """
         Initialize NPT decoder layer.
-        
+
         Args:
             config: Model configuration
             layer_idx: Layer index in the model
         """
         super().__init__(config, layer_idx)
-        
+
         # Store config for access in forward method
         self.config = config
-        
+
         # Add NP component
         self.np_component = NPComponent(
             d_model=config.hidden_size,
@@ -59,10 +59,10 @@ class NPTDecoderLayer(LlamaDecoderLayer):
             num_ranks=getattr(config, 'num_ranks', 1),  # Support rank-k updates
             init_strategy=getattr(config, 'init_strategy', 'improved')  # Better initialization
         )
-        
+
         # Flag to toggle between NPT and standard mode
         self.use_npt = True
-        
+
         # Store original MLP for reference
         self.original_mlp = self.mlp
         
@@ -171,9 +171,9 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         # Apply post-attention layer norm to the original hidden states (residual)
         # This is where we diverge significantly from standard transformer
         mlp_input = self.post_attention_layernorm(residual)
-        
-        # Apply modulated MLP (use efficient version)
-        mlp_output = self._apply_modulated_mlp_efficient(mlp_input, v_a, v_b)
+
+        # Apply modulated MLP
+        mlp_output = self._apply_modulated_mlp(mlp_input, v_a, v_b)
         
         # Add residual connection AFTER MLP (preserving this connection)
         hidden_states = residual + mlp_output
@@ -201,74 +201,8 @@ class NPTDecoderLayer(LlamaDecoderLayer):
     ) -> torch.Tensor:
         """
         Apply MLP with dynamically modulated weights.
-        
-        The standard Llama MLP uses SwiGLU:
-        output = down_proj(silu(gate_proj(x)) * up_proj(x))
-        
-        In NPT mode, we modulate the gate_proj weights with the rank-1 update.
-        
-        Args:
-            hidden_states: Input to MLP (batch_size, seq_len, hidden_size)
-            v_a: First vector from NP component (batch_size, seq_len, hidden_size)
-            v_b: Second vector from NP component (batch_size, seq_len, intermediate_size)
-        
-        Returns:
-            MLP output (batch_size, seq_len, hidden_size)
-        """
-        batch_size, seq_len, hidden_size = hidden_states.shape
-        intermediate_size = self.mlp.gate_proj.out_features
-        
-        # Get base weights
-        W_gate_base = self.mlp.gate_proj.weight  # (intermediate_size, hidden_size)
-        W_up = self.mlp.up_proj.weight  # (intermediate_size, hidden_size)
-        W_down = self.mlp.down_proj.weight  # (hidden_size, intermediate_size)
-        
-        # Process each token with its unique weight modulation
-        outputs = []
-        
-        for b in range(batch_size):
-            for t in range(seq_len):
-                # Get per-token vectors
-                v_a_token = v_a[b, t]  # (hidden_size,)
-                v_b_token = v_b[b, t]  # (intermediate_size,)
-                h_token = hidden_states[b, t]  # (hidden_size,)
-                
-                # Compute rank-1 weight update
-                # ΔW = outer(v_b, v_a) but we can apply it efficiently
-                # Instead of: W_modulated = W_base + outer(v_b, v_a)
-                # We compute: (W_base @ h) + v_b * (v_a @ h)
-                
-                # Standard gate projection
-                gate_base = F.linear(h_token, W_gate_base)  # (intermediate_size,)
-                
-                # Add rank-1 modulation
-                # This is equivalent to (W_base + outer(v_b, v_a)) @ h
-                modulation = v_b_token * (v_a_token @ h_token)
-                gate_modulated = gate_base + modulation
-                
-                # Rest of SwiGLU computation (unchanged)
-                up = F.linear(h_token, W_up)
-                intermediate = F.silu(gate_modulated) * up
-                output = F.linear(intermediate, W_down)
-                
-                outputs.append(output)
-        
-        # Stack outputs back to tensor
-        outputs = torch.stack(outputs, dim=0)  # (batch_size * seq_len, hidden_size)
-        outputs = outputs.view(batch_size, seq_len, hidden_size)
-        
-        return outputs
-    
-    def _apply_modulated_mlp_efficient(
-        self,
-        hidden_states: torch.Tensor,
-        v_a: torch.Tensor,
-        v_b: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Efficient batched version of modulated MLP.
-        
-        This version processes all tokens at once using broadcasting.
+
+        Efficiently processes all tokens at once using broadcasting.
         Handles both rank-1 and rank-k modulation.
         
         Args:

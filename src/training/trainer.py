@@ -209,13 +209,14 @@ class NPTTrainer:
         """
         self.model.train()
         start_time = time.time()
-        
+
         # Move batch to device
         batch = {k: v.to(self.config.device) for k, v in batch.items()}
-        
-        # Zero gradients
-        self.optimizer.zero_grad()
-        
+
+        # Zero gradients only at the start of accumulation cycle
+        if self.batch_count % self.config.gradient_accumulation_steps == 0:
+            self.optimizer.zero_grad()
+
         # Forward pass with mixed precision if enabled
         if self.scaler is not None:
             with torch.cuda.amp.autocast():
