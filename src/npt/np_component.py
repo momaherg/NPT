@@ -44,19 +44,14 @@ class NPComponent(nn.Module):
         self.single_layer_mode = single_layer_mode
         self.num_ranks = num_ranks
         self.init_strategy = init_strategy
-        
-        # For single layer mode, adjust rank based on num_ranks
+
+        # Always use the user-specified rank
+        self.rank = rank
+
+        # For single layer mode, use smaller initialization scale
         if single_layer_mode:
-            # Distribute capacity across multiple ranks
-            if num_ranks == 1:
-                self.rank = max(256, rank * 4)  # Original behavior
-            else:
-                # Keep total capacity similar but distributed
-                total_capacity = max(256, rank * 4)
-                self.rank = max(64, total_capacity // num_ranks)
             self.init_scale = min(0.001, init_scale)  # Very small initialization
         else:
-            self.rank = rank
             self.init_scale = init_scale
         
         # Create weight matrices - backward compatible structure

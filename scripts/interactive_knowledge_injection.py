@@ -42,33 +42,69 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, int]:
+def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, int]]:
     """
-    Detect which layers have NPT weights and their ranks.
-    
+    Detect which layers have NPT weights, their ranks, and num_ranks.
+
     Args:
         weights_dict: Dictionary of NPT weights
-    
+
     Returns:
-        Dictionary mapping layer index to detected rank
+        Dictionary mapping layer index to tuple of (rank, num_ranks)
     """
     layer_info = {}
-    
+
+    # Track W_down keys per layer to detect num_ranks
+    layer_w_downs = {}
+
     for key in weights_dict.keys():
-        # Parse keys like "layer_0_np.W_down" or "model.layers.0.np_component.W_down"
+        # Parse keys for W_down weights
         if "W_down" in key:
+            layer_idx = None
+            component_idx = None
+
             if key.startswith("layer_") and "_np." in key:
-                # Format: layer_0_np.W_down
-                layer_idx = int(key.split("_")[1])
-                rank = weights_dict[key].shape[1]  # W_down shape is [hidden_size, rank]
-                layer_info[layer_idx] = rank
+                # Format: layer_0_np.W_down or layer_0_np.W_down.0
+                parts = key.split(".")
+                layer_idx = int(parts[0].split("_")[1])
+                if len(parts) > 2 and parts[2].isdigit():
+                    # Rank-k format: layer_0_np.W_down.0
+                    component_idx = int(parts[2])
+
             elif "model.layers." in key and ".np_component." in key:
-                # Format: model.layers.0.np_component.W_down
+                # Format: model.layers.0.np_component.W_down or model.layers.0.np_component.W_down.0
                 parts = key.split(".")
                 layer_idx = int(parts[2])  # model.layers.{idx}
-                rank = weights_dict[key].shape[1]
-                layer_info[layer_idx] = rank
-    
+                # Check if there's a component index
+                w_down_idx = parts.index("W_down")
+                if len(parts) > w_down_idx + 1 and parts[w_down_idx + 1].isdigit():
+                    component_idx = int(parts[w_down_idx + 1])
+
+            if layer_idx is not None:
+                if layer_idx not in layer_w_downs:
+                    layer_w_downs[layer_idx] = {}
+
+                # Store weight info with component index (None for rank-1)
+                if component_idx is not None:
+                    layer_w_downs[layer_idx][component_idx] = weights_dict[key]
+                else:
+                    layer_w_downs[layer_idx][None] = weights_dict[key]
+
+    # Process collected weights to determine rank and num_ranks
+    for layer_idx, components in layer_w_downs.items():
+        if None in components:
+            # Rank-1 case (no component indices)
+            rank = components[None].shape[1]
+            num_ranks = 1
+        else:
+            # Rank-k case (has component indices)
+            num_ranks = len(components)
+            # Get rank from first component
+            first_weight = list(components.values())[0]
+            rank = first_weight.shape[1]
+
+        layer_info[layer_idx] = (rank, num_ranks)
+
     return layer_info
 
 
@@ -141,11 +177,12 @@ class KnowledgeInjector:
             }
         }
         
-        # Add rank information for each layer
+        # Add rank and num_ranks information for each layer
         for idx in self.available_layers:
             if idx in self.model.npt_layers:
                 layer = self.model.npt_layers[idx]
                 info[f"layer_{idx}_rank"] = layer.np_component.rank
+                info[f"layer_{idx}_num_ranks"] = layer.np_component.num_ranks
         
         return info
     
@@ -175,13 +212,15 @@ class KnowledgeInjector:
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
         """
         Extract delta weights (v_a, v_b) from processing a text.
-        
+
         Args:
             text: The text containing the fact to inject
             target_position: Position to extract weights from ("last", "first", "all")
-        
+
         Returns:
             Tuple of (v_a, v_b, metadata)
+            For rank-1: v_a shape (d_model,), v_b shape (d_ffn,)
+            For rank-k: v_a shape (num_ranks, d_model), v_b shape (num_ranks, d_ffn)
         """
         # Tokenize the input
         inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
@@ -254,7 +293,10 @@ class KnowledgeInjector:
         
         if v_a_collected is None or v_b_collected is None:
             raise RuntimeError("Failed to collect v_a and v_b from NPT layer")
-        
+
+        # Check if rank-k (4D) or rank-1 (3D)
+        is_rank_k = v_a_collected.dim() == 4
+
         # Select position based on target_position
         if target_position == "last":
             # Get the last non-padding token position
@@ -265,29 +307,64 @@ class KnowledgeInjector:
                 last_pos = non_pad_mask.nonzero()[-1].item() if non_pad_mask.any() else seq_len - 1
             else:
                 last_pos = seq_len - 1
-            
-            v_a = v_a_collected[:, last_pos, :].squeeze(0)
-            v_b = v_b_collected[:, last_pos, :].squeeze(0)
+
+            if is_rank_k:
+                # v_a_collected: (batch, seq, num_ranks, d_model)
+                v_a = v_a_collected[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_model)
+                v_b = v_b_collected[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_ffn)
+            else:
+                # v_a_collected: (batch, seq, d_model)
+                v_a = v_a_collected[:, last_pos, :].squeeze(0)  # (d_model,)
+                v_b = v_b_collected[:, last_pos, :].squeeze(0)  # (d_ffn,)
         elif target_position == "first":
-            v_a = v_a_collected[:, 0, :].squeeze(0)
-            v_b = v_b_collected[:, 0, :].squeeze(0)
+            if is_rank_k:
+                v_a = v_a_collected[:, 0, :, :].squeeze(0)  # (num_ranks, d_model)
+                v_b = v_b_collected[:, 0, :, :].squeeze(0)  # (num_ranks, d_ffn)
+            else:
+                v_a = v_a_collected[:, 0, :].squeeze(0)  # (d_model,)
+                v_b = v_b_collected[:, 0, :].squeeze(0)  # (d_ffn,)
         elif target_position == "all":
             # Average across all positions
-            v_a = v_a_collected.mean(dim=1).squeeze(0)
-            v_b = v_b_collected.mean(dim=1).squeeze(0)
+            if is_rank_k:
+                v_a = v_a_collected.mean(dim=1).squeeze(0)  # (num_ranks, d_model)
+                v_b = v_b_collected.mean(dim=1).squeeze(0)  # (num_ranks, d_ffn)
+            else:
+                v_a = v_a_collected.mean(dim=1).squeeze(0)  # (d_model,)
+                v_b = v_b_collected.mean(dim=1).squeeze(0)  # (d_ffn,)
         else:
             raise ValueError(f"Unknown target_position: {target_position}")
         
         # Compute some metadata
-        metadata = {
-            "text": text,
-            "position": target_position,
-            "v_a_norm": v_a.norm().item(),
-            "v_b_norm": v_b.norm().item(),
-            "delta_w_rank1_norm": (v_b.norm() * v_a.norm()).item(),
-            "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
-            "layer_idx": self.active_layer_idx
-        }
+        if is_rank_k:
+            # For rank-k, compute norms and provide num_ranks info
+            num_ranks = v_a.shape[0]
+            # Compute norm of the sum of rank-1 components
+            total_v_a_norm = v_a.norm(dim=-1).sum().item()  # Sum of norms across ranks
+            total_v_b_norm = v_b.norm(dim=-1).sum().item()
+            metadata = {
+                "text": text,
+                "position": target_position,
+                "v_a_norm": total_v_a_norm,
+                "v_b_norm": total_v_b_norm,
+                "delta_w_rank_norm": total_v_a_norm * total_v_b_norm,  # Approximate
+                "num_ranks": num_ranks,
+                "is_rank_k": True,
+                "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+                "layer_idx": self.active_layer_idx
+            }
+        else:
+            # Rank-1 metadata
+            metadata = {
+                "text": text,
+                "position": target_position,
+                "v_a_norm": v_a.norm().item(),
+                "v_b_norm": v_b.norm().item(),
+                "delta_w_rank1_norm": (v_b.norm() * v_a.norm()).item(),
+                "num_ranks": 1,
+                "is_rank_k": False,
+                "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+                "layer_idx": self.active_layer_idx
+            }
         
         return v_a, v_b, metadata
     
@@ -321,14 +398,25 @@ class KnowledgeInjector:
         # Get the NPT layer
         npt_layer = self.model.npt_layers[self.active_layer_idx]
         
-        # Apply the rank-1 update to the MLP weights
+        # Apply the rank-k or rank-1 update to the MLP weights
         with torch.no_grad():
             # Get current MLP input weights
             W_in = npt_layer.mlp.gate_proj.weight  # Shape: [intermediate_size, hidden_size]
-            
-            # Compute rank-1 update: ΔW = α * outer(v_b, v_a)
-            # v_b shape: [intermediate_size], v_a shape: [hidden_size]
-            delta_W = alpha * torch.outer(v_b, v_a)
+
+            # Check if rank-k or rank-1
+            if metadata.get('is_rank_k', False) and v_a.dim() == 2:
+                # Rank-k update: sum of k rank-1 updates
+                # v_a shape: [num_ranks, hidden_size]
+                # v_b shape: [num_ranks, intermediate_size]
+                delta_W = torch.zeros_like(W_in)
+                num_ranks = v_a.shape[0]
+                for i in range(num_ranks):
+                    # Each rank-1 component
+                    delta_W += alpha * torch.outer(v_b[i], v_a[i])
+            else:
+                # Rank-1 update: ΔW = α * outer(v_b, v_a)
+                # v_b shape: [intermediate_size], v_a shape: [hidden_size]
+                delta_W = alpha * torch.outer(v_b, v_a)
             
             # Store original weights per layer if first injection and not accumulating
             if self.active_layer_idx not in self.original_weights or not accumulate:
@@ -351,7 +439,9 @@ class KnowledgeInjector:
                 "v_b_norm": metadata["v_b_norm"],
                 "delta_norm": delta_W.norm().item(),
                 "weight_change_ratio": (delta_W.norm() / W_in.norm()).item(),
-                "layer_idx": self.active_layer_idx
+                "layer_idx": self.active_layer_idx,
+                "num_ranks": metadata.get("num_ranks", 1),
+                "is_rank_k": metadata.get("is_rank_k", False)
             }
             
             # Initialize list for this layer if needed
@@ -364,6 +454,8 @@ class KnowledgeInjector:
         print(f"  - Delta weight norm: {delta_W.norm().item():.6f}")
         print(f"  - Weight change ratio: {injection_info['weight_change_ratio']:.6f}")
         print(f"  - v_a norm: {metadata['v_a_norm']:.4f}, v_b norm: {metadata['v_b_norm']:.4f}")
+        if metadata.get('is_rank_k', False):
+            print(f"  - Num ranks: {metadata['num_ranks']} (rank-k update)")
         
         return injection_info
     
@@ -511,6 +603,10 @@ class KnowledgeInjector:
                 "npt_layers": self.available_layers,
                 "npt_ranks": {
                     idx: self.model.npt_layers[idx].np_component.rank
+                    for idx in self.available_layers
+                },
+                "npt_num_ranks": {
+                    idx: self.model.npt_layers[idx].np_component.num_ranks
                     for idx in self.available_layers
                 }
             }
@@ -660,12 +756,15 @@ class InteractiveSession:
                     print(f"\n  Layer details:")
                     for idx in info['available_layers']:
                         rank_key = f"layer_{idx}_rank"
+                        num_ranks_key = f"layer_{idx}_num_ranks"
                         rank = info.get(rank_key, "unknown")
+                        num_ranks = info.get(num_ranks_key, 1)
                         facts_count = info['injected_facts_count'].get(idx, 0)
                         active_marker = " (active)" if idx == info['active_layer'] else ""
                         mode = "NPT" if modes.get(idx, True) else "standard"
                         mode_color = Fore.GREEN if modes.get(idx, True) else Fore.YELLOW
-                        print(f"    Layer {idx}: rank={rank}, mode={mode_color}{mode}{Style.RESET_ALL}, injected_facts={facts_count}{active_marker}")
+                        rank_info = f"rank={rank}" if num_ranks == 1 else f"rank={rank}×{num_ranks}"
+                        print(f"    Layer {idx}: {rank_info}, mode={mode_color}{mode}{Style.RESET_ALL}, injected_facts={facts_count}{active_marker}")
                 
                 elif command == "layer":
                     # Switch to a specific layer
@@ -706,7 +805,8 @@ class InteractiveSession:
                                 print(f"\n{Fore.YELLOW}Layer {layer_idx}:{Style.RESET_ALL}")
                                 for i, fact_info in enumerate(facts, 1):
                                     print(f"  {i}. {fact_info['fact']}")
-                                    print(f"     Alpha: {fact_info['alpha']:.2f}, Position: {fact_info['position']}")
+                                    ranks_str = f", Ranks: {fact_info.get('num_ranks', 1)}" if fact_info.get('is_rank_k', False) else ""
+                                    print(f"     Alpha: {fact_info['alpha']:.2f}, Position: {fact_info['position']}{ranks_str}")
                                     print(f"     Weight change: {fact_info['weight_change_ratio']:.6f}")
                     else:
                         print(f"{Fore.YELLOW}No facts injected yet.{Style.RESET_ALL}")
@@ -854,9 +954,10 @@ def main():
             available_layers = sorted(layer_info.keys())
             print(f"  Detected NPT weights for layers: {available_layers}")
             
-            # Show rank information
-            for layer_idx, rank in layer_info.items():
-                print(f"    Layer {layer_idx}: rank={rank}")
+            # Show rank and num_ranks information
+            for layer_idx, (rank, num_ranks) in layer_info.items():
+                rank_str = f"rank={rank}" if num_ranks == 1 else f"rank={rank}×{num_ranks}"
+                print(f"    Layer {layer_idx}: {rank_str}")
             
             # Determine which layers to actually use as NPT
             if args.use_npt_layers is None:
@@ -895,38 +996,43 @@ def main():
             
             # Convert only the selected layers to NPT  
             if layers_to_use:
-                # Group layers by rank for efficient conversion
-                layers_by_rank = {}
+                # Group layers by (rank, num_ranks) for efficient conversion
+                layers_by_config = {}
                 for layer_idx in layers_to_use:
-                    rank = layer_info[layer_idx]
-                    if rank not in layers_by_rank:
-                        layers_by_rank[rank] = []
-                    layers_by_rank[rank].append(layer_idx)
+                    rank, num_ranks = layer_info[layer_idx]
+                    config_key = (rank, num_ranks)
+                    if config_key not in layers_by_config:
+                        layers_by_config[config_key] = []
+                    layers_by_config[config_key].append(layer_idx)
                 
-                if len(layers_by_rank) == 1:
-                    # All selected layers have the same rank - convert together
-                    detected_rank = list(layers_by_rank.keys())[0]
-                    
+                if len(layers_by_config) == 1:
+                    # All selected layers have the same configuration - convert together
+                    (detected_rank, detected_num_ranks) = list(layers_by_config.keys())[0]
+
                     npt_config = NPTConfig(
                         layers_to_convert=layers_to_use,
                         np_rank=detected_rank,
                         np_init_scale=0.001,
+                        num_ranks=detected_num_ranks,
                         single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
                     )
                     model.convert_to_npt(npt_config)
-                    print(f"  Converted {len(layers_to_use)} layers to NPT mode with rank={detected_rank}")
+                    rank_str = f"rank={detected_rank}" if detected_num_ranks == 1 else f"rank={detected_rank}×{detected_num_ranks}"
+                    print(f"  Converted {len(layers_to_use)} layers to NPT mode with {rank_str}")
                 else:
-                    # Different ranks for different groups - convert by rank groups
-                    print(f"  {Fore.YELLOW}Detected different ranks, converting by rank groups:{Style.RESET_ALL}")
-                    for rank, layer_indices in sorted(layers_by_rank.items()):
+                    # Different configurations for different groups - convert by config groups
+                    print(f"  {Fore.YELLOW}Detected different configurations, converting by groups:{Style.RESET_ALL}")
+                    for (rank, num_ranks), layer_indices in sorted(layers_by_config.items()):
                         npt_config = NPTConfig(
                             layers_to_convert=layer_indices,
                             np_rank=rank,
                             np_init_scale=0.001,
+                            num_ranks=num_ranks,
                             single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
                         )
                         model.convert_to_npt(npt_config)
-                        print(f"    Converted layers {layer_indices} with rank={rank}")
+                        rank_str = f"rank={rank}" if num_ranks == 1 else f"rank={rank}×{num_ranks}"
+                        print(f"    Converted layers {layer_indices} with {rank_str}")
                     print(f"  Total: Converted {len(layers_to_use)} layers to NPT mode")
                 
                 # Load NPT weights for all available layers (even those not in NPT mode)

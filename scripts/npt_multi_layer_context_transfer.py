@@ -82,7 +82,7 @@ class MultiLayerNPTContextTransfer:
                 
                 def hook_fn(module, input, output):
                     """Hook that captures or overrides v_a, v_b for this layer."""
-                    
+
                     # Check if we should override for this layer
                     if idx in self.override_v_a and idx in self.override_v_b:
                         # Override mode - replace modulation
@@ -90,33 +90,53 @@ class MultiLayerNPTContextTransfer:
                             # Get original computed v_a, v_b
                             computed_v_a = output[0]
                             computed_v_b = output[1]
-                            
-                            batch_size, seq_len, hidden_size = computed_v_a.shape
-                            
+
+                            # Check if rank-k (4D) or rank-1 (3D)
+                            is_rank_k = computed_v_a.dim() == 4
+
+                            if is_rank_k:
+                                batch_size, seq_len, num_ranks, hidden_size = computed_v_a.shape
+                            else:
+                                batch_size, seq_len, hidden_size = computed_v_a.shape
+
                             # Clone to avoid modifying the original
                             new_v_a = computed_v_a.clone()
                             new_v_b = computed_v_b.clone()
-                            
+
                             if self.transfer_mode == "last":
                                 # Replace ONLY the last token's modulation
-                                new_v_a[:, -1, :] = self.override_v_a[idx][:, -1, :]
-                                new_v_b[:, -1, :] = self.override_v_b[idx][:, -1, :]
+                                if is_rank_k:
+                                    new_v_a[:, -1, :, :] = self.override_v_a[idx][:, -1, :, :]
+                                    new_v_b[:, -1, :, :] = self.override_v_b[idx][:, -1, :, :]
+                                else:
+                                    new_v_a[:, -1, :] = self.override_v_a[idx][:, -1, :]
+                                    new_v_b[:, -1, :] = self.override_v_b[idx][:, -1, :]
                             elif self.transfer_mode == "last_n":
                                 # Replace the last N tokens
                                 n_tokens = min(3, seq_len, self.override_v_a[idx].shape[1])
-                                new_v_a[:, -n_tokens:, :] = self.override_v_a[idx][:, -n_tokens:, :]
-                                new_v_b[:, -n_tokens:, :] = self.override_v_b[idx][:, -n_tokens:, :]
+                                if is_rank_k:
+                                    new_v_a[:, -n_tokens:, :, :] = self.override_v_a[idx][:, -n_tokens:, :, :]
+                                    new_v_b[:, -n_tokens:, :, :] = self.override_v_b[idx][:, -n_tokens:, :, :]
+                                else:
+                                    new_v_a[:, -n_tokens:, :] = self.override_v_a[idx][:, -n_tokens:, :]
+                                    new_v_b[:, -n_tokens:, :] = self.override_v_b[idx][:, -n_tokens:, :]
                             elif self.transfer_mode == "avg_last":
                                 # Use average of last few tokens from context
-                                avg_v_a = self.override_v_a[idx][:, -5:, :].mean(dim=1)
-                                avg_v_b = self.override_v_b[idx][:, -5:, :].mean(dim=1)
-                                new_v_a[:, -1, :] = avg_v_a
-                                new_v_b[:, -1, :] = avg_v_b
-                            
+                                if is_rank_k:
+                                    avg_v_a = self.override_v_a[idx][:, -5:, :, :].mean(dim=1)
+                                    avg_v_b = self.override_v_b[idx][:, -5:, :, :].mean(dim=1)
+                                    new_v_a[:, -1, :, :] = avg_v_a
+                                    new_v_b[:, -1, :, :] = avg_v_b
+                                else:
+                                    avg_v_a = self.override_v_a[idx][:, -5:, :].mean(dim=1)
+                                    avg_v_b = self.override_v_b[idx][:, -5:, :].mean(dim=1)
+                                    new_v_a[:, -1, :] = avg_v_a
+                                    new_v_b[:, -1, :] = avg_v_b
+
                             # Store the modified versions for analysis
                             self.captured_v_a[idx] = new_v_a.detach().clone()
                             self.captured_v_b[idx] = new_v_b.detach().clone()
-                            
+
                             return (new_v_a, new_v_b)
                     
                     # Capture mode - just store the values
@@ -259,7 +279,14 @@ class MultiLayerNPTContextTransfer:
         print(f"\nCaptured modulations from layers:")
         for layer_idx in sorted(baseline_modulations.keys()):
             v_a, v_b = baseline_modulations[layer_idx]
-            print(f"  Layer {layer_idx}: v_a norm={v_a.norm():.4f}, v_b norm={v_b.norm():.4f}")
+            # Handle both rank-1 and rank-k
+            if v_a.dim() == 4:  # rank-k
+                v_a_norm = v_a.norm(dim=(-2, -1)).mean().item()  # Average across batch/seq
+                v_b_norm = v_b.norm(dim=(-2, -1)).mean().item()
+                num_ranks = v_a.shape[2]
+                print(f"  Layer {layer_idx}: v_a norm={v_a_norm:.4f}, v_b norm={v_b_norm:.4f} (rank-{num_ranks})")
+            else:  # rank-1
+                print(f"  Layer {layer_idx}: v_a norm={v_a.norm():.4f}, v_b norm={v_b.norm():.4f}")
         
         # ========== Run 2: With false context ==========
         print(f"\n{Fore.YELLOW}Run 2: With False Context{Style.RESET_ALL}")
@@ -290,7 +317,14 @@ class MultiLayerNPTContextTransfer:
         print(f"\nCaptured modulations from layers:")
         for layer_idx in sorted(context_modulations.keys()):
             v_a, v_b = context_modulations[layer_idx]
-            print(f"  Layer {layer_idx}: v_a norm={v_a.norm():.4f}, v_b norm={v_b.norm():.4f}")
+            # Handle both rank-1 and rank-k
+            if v_a.dim() == 4:  # rank-k
+                v_a_norm = v_a.norm(dim=(-2, -1)).mean().item()
+                v_b_norm = v_b.norm(dim=(-2, -1)).mean().item()
+                num_ranks = v_a.shape[2]
+                print(f"  Layer {layer_idx}: v_a norm={v_a_norm:.4f}, v_b norm={v_b_norm:.4f} (rank-{num_ranks})")
+            else:  # rank-1
+                print(f"  Layer {layer_idx}: v_a norm={v_a.norm():.4f}, v_b norm={v_b.norm():.4f}")
         
         # ========== Run 3: Multi-Layer Context Transfer ==========
         print(f"\n{Fore.YELLOW}Run 3: Multi-Layer Context Transfer{Style.RESET_ALL}")
@@ -319,15 +353,23 @@ class MultiLayerNPTContextTransfer:
                     baseline_v_a, _ = baseline_modulations[layer_idx]
                     context_v_a, _ = context_modulations[layer_idx]
                     transfer_v_a = self.captured_v_a[layer_idx]
-                    
-                    baseline_norm = baseline_v_a[0, -1, :].norm()
-                    context_norm = context_v_a[0, -1, :].norm()
-                    transfer_norm = transfer_v_a[0, -1, :].norm()
-                    
-                    # Check if transfer worked
-                    match = torch.allclose(transfer_v_a[0, -1, :], context_v_a[0, -1, :], rtol=1e-4)
+
+                    # Handle both rank-1 and rank-k
+                    if baseline_v_a.dim() == 4:  # rank-k
+                        baseline_norm = baseline_v_a[0, -1, :, :].norm()
+                        context_norm = context_v_a[0, -1, :, :].norm()
+                        transfer_norm = transfer_v_a[0, -1, :, :].norm()
+                        # Check if transfer worked (for all rank components)
+                        match = torch.allclose(transfer_v_a[0, -1, :, :], context_v_a[0, -1, :, :], rtol=1e-4)
+                    else:  # rank-1
+                        baseline_norm = baseline_v_a[0, -1, :].norm()
+                        context_norm = context_v_a[0, -1, :].norm()
+                        transfer_norm = transfer_v_a[0, -1, :].norm()
+                        # Check if transfer worked
+                        match = torch.allclose(transfer_v_a[0, -1, :], context_v_a[0, -1, :], rtol=1e-4)
+
                     status = f"{Fore.GREEN}✓{Style.RESET_ALL}" if match else f"{Fore.RED}✗{Style.RESET_ALL}"
-                    
+
                     print(f"  Layer {layer_idx}: baseline={baseline_norm:.4f}, "
                           f"context={context_norm:.4f}, transfer={transfer_norm:.4f} {status}")
             
@@ -366,17 +408,44 @@ class MultiLayerNPTContextTransfer:
                 if layer_idx in context_modulations:
                     baseline_v_a, baseline_v_b = baseline_modulations[layer_idx]
                     context_v_a, context_v_b = context_modulations[layer_idx]
-                    
-                    # Focus on last token
-                    v_a_diff = (context_v_a[0, -1, :] - baseline_v_a[0, -1, :]).norm()
-                    v_b_diff = (context_v_b[0, -1, :] - baseline_v_b[0, -1, :]).norm()
-                    
-                    cos_sim_a = F.cosine_similarity(
-                        baseline_v_a[0, -1, :].unsqueeze(0),
-                        context_v_a[0, -1, :].unsqueeze(0)
-                    ).item()
-                    
-                    print(f"  Layer {layer_idx}:")
+
+                    # Handle both rank-1 and rank-k
+                    if baseline_v_a.dim() == 4:  # rank-k
+                        # Focus on last token, aggregate across ranks
+                        baseline_last = baseline_v_a[0, -1, :, :]  # (num_ranks, hidden_size)
+                        context_last = context_v_a[0, -1, :, :]
+
+                        # Compute differences for each rank and average
+                        v_a_diffs = [(context_last[i] - baseline_last[i]).norm().item()
+                                    for i in range(baseline_last.shape[0])]
+                        v_a_diff = sum(v_a_diffs) / len(v_a_diffs)
+
+                        baseline_last_b = baseline_v_b[0, -1, :, :]  # (num_ranks, ffn_size)
+                        context_last_b = context_v_b[0, -1, :, :]
+                        v_b_diffs = [(context_last_b[i] - baseline_last_b[i]).norm().item()
+                                    for i in range(baseline_last_b.shape[0])]
+                        v_b_diff = sum(v_b_diffs) / len(v_b_diffs)
+
+                        # Cosine similarity averaged across ranks
+                        cos_sims = [F.cosine_similarity(baseline_last[i].unsqueeze(0),
+                                                        context_last[i].unsqueeze(0)).item()
+                                   for i in range(baseline_last.shape[0])]
+                        cos_sim_a = sum(cos_sims) / len(cos_sims)
+
+                        num_ranks = baseline_v_a.shape[2]
+                        print(f"  Layer {layer_idx} (rank-{num_ranks}):")
+                    else:  # rank-1
+                        # Focus on last token
+                        v_a_diff = (context_v_a[0, -1, :] - baseline_v_a[0, -1, :]).norm()
+                        v_b_diff = (context_v_b[0, -1, :] - baseline_v_b[0, -1, :]).norm()
+
+                        cos_sim_a = F.cosine_similarity(
+                            baseline_v_a[0, -1, :].unsqueeze(0),
+                            context_v_a[0, -1, :].unsqueeze(0)
+                        ).item()
+
+                        print(f"  Layer {layer_idx}:")
+
                     print(f"    v_a difference: {v_a_diff:.4f}, cosine sim: {cos_sim_a:.4f}")
                     print(f"    v_b difference: {v_b_diff:.4f}")
         else:

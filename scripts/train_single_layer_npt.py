@@ -86,7 +86,7 @@ def parse_args():
         "--np_rank",
         type=int,
         default=256,
-        help="Rank for NP component (automatically increased for single layer)"
+        help="Rank for NP component"
     )
     parser.add_argument(
         "--np_init_scale",
@@ -1005,7 +1005,7 @@ def main():
     logger.info(f"Training Configuration:")
     logger.info(f"  Model: {args.model_name} ({args.model_size})")
     logger.info(f"  NPT Layer: {layer_idx}")
-    logger.info(f"  NPT Rank: {args.np_rank} (effective: {model.model.layers[layer_idx].np_component.rank})")
+    logger.info(f"  NPT Rank: {args.np_rank}")
     logger.info(f"  Num Ranks (rank-k): {args.num_ranks}")
     logger.info(f"  Total Steps: {args.max_steps}")
     logger.info(f"  Gradient Scale Factor: {args.gradient_scale_factor}x")
