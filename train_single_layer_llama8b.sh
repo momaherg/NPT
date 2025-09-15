@@ -13,12 +13,12 @@ python scripts/train_single_layer_npt.py \
   --init_strategy improved \
   --convert_layers "15" \
   --single_layer_mode \
-  --num_ranks 32 \
-  --np_rank 256 \
+  --num_ranks 1 \
+  --np_rank 512 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
-  --batch_size 6 \
-  --gradient_accumulation_steps 5 \
+  --batch_size 16 \
+  --gradient_accumulation_steps 1 \
   --learning_rate 1e-5 \
   --weight_decay 0.01 \
   --lambda_reg 0.01 \
@@ -36,7 +36,7 @@ python scripts/train_single_layer_npt.py \
   --generation_steps 500 \
   --num_workers 1 \
   --wandb_project npt-single-layer \
-  --wandb_name npt_8b_layer15_single_instruct_direct-64x64 \
+  --wandb_name npt_8b_layer15_single_instruct_direct-1x512 \
   --wandb_tags llama-3.1 8b layer_15 single_layer two_stage direct_supervision
 
 # Training Stages:
