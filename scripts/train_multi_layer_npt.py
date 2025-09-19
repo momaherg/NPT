@@ -158,12 +158,12 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
 
             # Process each layer
             for i in range(len(self.model.model.layers)):
-                # Store state before layer
-                teacher_states[f"before_{i}"] = hidden_states.clone()
-
                 layer = self.model.model.layers[i]
 
                 if i in self.layers_to_train:
+                    # Store state before layer (only for NPT layers to save memory)
+                    teacher_states[f"before_{i}"] = hidden_states.clone()
+
                     # For NPT layers, collect detailed outputs
                     residual = hidden_states
                     normed = layer.input_layernorm(hidden_states)
@@ -202,8 +202,7 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                     )
                     hidden_states = layer_out[0] if isinstance(layer_out, tuple) else layer_out
 
-                # Store state after layer
-                teacher_states[f"after_{i}"] = hidden_states.clone()
+                # Don't store intermediate states for non-NPT layers to save memory
 
             # Final layer norm and LM head for teacher output
             hidden_states = self.model.model.norm(hidden_states)
@@ -226,6 +225,10 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
 
         # Step 1: Collect teacher states
         teacher_states = self.collect_teacher_states(input_ids)
+
+        # Clear CUDA cache between teacher and student passes to free memory
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
 
         # Step 2: Run NPT layers with appropriate inputs
         self.model.set_npt_mode(True)
@@ -289,6 +292,13 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                     'hidden_states': mlp_input
                 }
 
+                # Delete teacher states for this layer after use to free memory
+                del teacher_states[f"attention_{i}"]
+                del teacher_states[f"mlp_with_attention_{i}"]
+                del teacher_states[f"residual_{i}"]
+                if f"before_{i}" in teacher_states:
+                    del teacher_states[f"before_{i}"]
+
                 # ALWAYS propagate NPT output to next layer
                 hidden_states = hidden_states + mlp_modulated
 
@@ -351,14 +361,19 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
             metrics[f'layer_{layer_idx}_v_a_norm'] = v_a.norm().item()
             metrics[f'layer_{layer_idx}_v_b_norm'] = v_b.norm().item()
 
-            # Compute attention similarity for monitoring
+            # Compute attention similarity for monitoring (only for rank-1)
             with torch.no_grad():
-                v_a_flat = v_a.view(-1, v_a.size(-1))
-                attn_flat = outputs['teacher_attention'].view(-1, outputs['teacher_attention'].size(-1))
-                v_a_norm = F.normalize(v_a_flat, p=2, dim=-1)
-                attn_norm = F.normalize(attn_flat, p=2, dim=-1)
-                similarity = (v_a_norm * attn_norm).sum(dim=-1).mean().item()
-                metrics[f'layer_{layer_idx}_v_a_attn_similarity'] = similarity
+                if v_a.dim() == 3:
+                    # Rank-1 case: compute similarity
+                    v_a_flat = v_a.view(-1, v_a.size(-1))
+                    attn_flat = outputs['teacher_attention'].view(-1, outputs['teacher_attention'].size(-1))
+                    v_a_norm = F.normalize(v_a_flat, p=2, dim=-1)
+                    attn_norm = F.normalize(attn_flat, p=2, dim=-1)
+                    similarity = (v_a_norm * attn_norm).sum(dim=-1).mean().item()
+                    metrics[f'layer_{layer_idx}_v_a_attn_similarity'] = similarity
+                else:
+                    # Rank-k case: skip similarity computation
+                    metrics[f'layer_{layer_idx}_v_a_attn_similarity'] = 0.0
 
         # Global fidelity loss
         fidelity_loss = F.mse_loss(npt_final, teacher_final)
@@ -529,6 +544,10 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                 self.global_step > 0):
                 self.run_multi_layer_evaluation()
 
+            # Clear cache periodically to prevent memory buildup
+            if self.global_step % 100 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
             return final_metrics, True
         else:
             return None, False
@@ -545,22 +564,72 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(self.val_loader):
-                if batch_idx >= 50:  # Limit evaluation batches
+                if batch_idx >= 10:  # Reduce evaluation batches to save memory
                     break
 
                 input_ids = batch['input_ids'].to(self.device)
 
-                # Collect outputs
-                layer_outputs, npt_final, teacher_final = self.collect_multi_layer_outputs(input_ids)
+                # Split batch if too large for evaluation
+                eval_batch_size = min(4, input_ids.size(0))  # Use smaller batch for eval
+                if input_ids.size(0) > eval_batch_size:
+                    # Process in smaller chunks
+                    chunk_losses = []
+                    chunk_layer_losses = {idx: [] for idx in self.layers_to_train}
 
-                # Compute loss
-                loss, metrics = self.compute_multi_layer_loss(layer_outputs, npt_final, teacher_final)
+                    for start_idx in range(0, input_ids.size(0), eval_batch_size):
+                        end_idx = min(start_idx + eval_batch_size, input_ids.size(0))
+                        input_chunk = input_ids[start_idx:end_idx]
+
+                        try:
+                            layer_outputs, npt_final, teacher_final = self.collect_multi_layer_outputs(input_chunk)
+                            chunk_loss, chunk_metrics = self.compute_multi_layer_loss(layer_outputs, npt_final, teacher_final)
+
+                            chunk_losses.append(chunk_loss.item())
+                            for layer_idx in self.layers_to_train:
+                                chunk_layer_losses[layer_idx].append(chunk_metrics[f'layer_{layer_idx}_direct_mlp'])
+
+                            del layer_outputs, npt_final, teacher_final
+                        except torch.cuda.OutOfMemoryError:
+                            logger.warning(f"OOM during eval chunk {start_idx}-{end_idx}, skipping...")
+                            torch.cuda.empty_cache()
+                            continue
+
+                    # Average chunk results
+                    if chunk_losses:
+                        loss = torch.tensor(sum(chunk_losses) / len(chunk_losses))
+                        metrics = {}
+                        for layer_idx in self.layers_to_train:
+                            if chunk_layer_losses[layer_idx]:
+                                metrics[f'layer_{layer_idx}_direct_mlp'] = sum(chunk_layer_losses[layer_idx]) / len(chunk_layer_losses[layer_idx])
+                            else:
+                                metrics[f'layer_{layer_idx}_direct_mlp'] = 0.0
+                    else:
+                        continue  # Skip this batch if all chunks failed
+                else:
+                    try:
+                        # Collect outputs
+                        layer_outputs, npt_final, teacher_final = self.collect_multi_layer_outputs(input_ids)
+
+                        # Compute loss
+                        loss, metrics = self.compute_multi_layer_loss(layer_outputs, npt_final, teacher_final)
+
+                        # Explicitly delete outputs to free memory
+                        del layer_outputs, npt_final, teacher_final
+
+                    except torch.cuda.OutOfMemoryError:
+                        logger.warning(f"OOM during evaluation at batch {batch_idx}, skipping...")
+                        torch.cuda.empty_cache()
+                        continue
 
                 total_loss += loss.item()
                 for layer_idx in self.layers_to_train:
                     layer_losses[layer_idx] += metrics[f'layer_{layer_idx}_direct_mlp']
 
                 num_batches += 1
+
+                # Clear cache periodically during evaluation
+                if batch_idx % 5 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Average losses
         avg_loss = total_loss / max(1, num_batches)

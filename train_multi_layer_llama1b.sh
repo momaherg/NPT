@@ -10,34 +10,35 @@ echo "=================================================="
 python scripts/train_multi_layer_npt.py \
   --model_name "meta-llama/Llama-3.2-1B" \
   --model_size 1b \
-  --train_layers "8,9,10,11,12,13,14,15" \
-  --curriculum_stages "teacher:3000,mixed:3000:0.5,student:14000" \
-  --layer_weights "linear" \
+  --train_layers "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" \
+  --curriculum_stages "teacher:20000" \
+  --layer_weights "uniform" \
   --init_strategy improved \
-  --num_ranks 1 \
-  --np_rank 128 \
+  --num_ranks 4 \
+  --np_rank 256 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
-  --batch_size 8 \
-  --gradient_accumulation_steps 2 \
+  --batch_size 32 \
+  --gradient_accumulation_steps 1 \
+  --max_length 256 \
   --learning_rate 1e-4 \
   --weight_decay 0.01 \
   --lambda_reg 0.01 \
   --direct_mlp_weight 10.0 \
   --fidelity_weight 1.0 \
-  --gradient_scale_factor 1.5 \
+  --gradient_scale_factor 2.5 \
   --max_steps 20000 \
-  --warmup_steps 500 \
+  --warmup_steps 1000 \
   --gradient_clip 0.5 \
   --mixed_precision \
   --logging_steps 10 \
-  --eval_steps 500 \
-  --num_eval_samples 100 \
-  --save_steps 2000 \
+  --eval_steps 999999 \
+  --num_eval_samples 1 \
+  --save_steps 400 \
   --generation_steps 500 \
-  --num_workers 4 \
+  --num_workers 1 \
   --wandb_project npt-multi-layer \
-  --wandb_name npt_1b_layers8-15_upper_half \
+  --wandb_name npt_1b_layers_full \
   --wandb_tags llama-3.2 1b multi_layer upper_half linear_weights
 
 # Configuration Notes:

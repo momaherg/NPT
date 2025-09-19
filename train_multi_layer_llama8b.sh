@@ -10,12 +10,12 @@ echo "=================================================="
 python scripts/train_multi_layer_npt.py \
   --model_name "meta-llama/Llama-3.1-8B-Instruct" \
   --model_size 8b \
-  --train_layers "14,15,16,17" \
+  --train_layers "15" \
   --curriculum_stages "teacher:1000,mixed:1000:0.3,mixed:1000:0.7,student:2000" \
   --layer_weights "uniform" \
   --init_strategy improved \
   --num_ranks 1 \
-  --np_rank 256 \
+  --np_rank 512 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
   --batch_size 4 \
@@ -25,19 +25,19 @@ python scripts/train_multi_layer_npt.py \
   --lambda_reg 0.01 \
   --direct_mlp_weight 10.0 \
   --fidelity_weight 1.0 \
-  --gradient_scale_factor 2.5 \
-  --max_steps 30000 \
-  --warmup_steps 1000 \
+  --gradient_scale_factor 10 \
+  --max_steps 6000 \
+  --warmup_steps 400 \
   --gradient_clip 0.5 \
   --mixed_precision \
   --logging_steps 10 \
-  --eval_steps 500 \
-  --num_eval_samples 100 \
-  --save_steps 2000 \
+  --eval_steps 200 \
+  --num_eval_samples 1 \
+  --save_steps 1000 \
   --generation_steps 500 \
-  --num_workers 2 \
-  --wandb_project npt-multi-layer \
-  --wandb_name npt_8b_layers14-17_teacher_scaffold \
+  --num_workers 1 \
+  --wandb_project npt-single-layer \
+  --wandb_name npt_8b_layers15_teacher_scaffold \
   --wandb_tags llama-3.1 8b multi_layer teacher_scaffolding curriculum
 
 # Curriculum Stages Explained:
