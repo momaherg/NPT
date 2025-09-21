@@ -164,19 +164,23 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         
         attn_output = attn_outputs[0]  # (batch_size, seq_len, hidden_size)
         
-        # CRITICAL DIFFERENCE: No residual connection after attention
-        # Instead, use attention output to generate weight update
+        # NEW ARCHITECTURE: Restore attention residual but modify MLP input
+        # Add attention to residual (standard transformer flow)
+        hidden_states = residual + attn_output
+
+        # Generate modulation from attention output
         v_a, v_b = self.np_component(attn_output)
-        
-        # Apply post-attention layer norm to the original hidden states (residual)
-        # This is where we diverge significantly from standard transformer
+
+        # CRITICAL: MLP takes only original residual, not h + attention
+        # This is the key difference - MLP modulation must make MLP(h) behave like MLP(h + attn)
         mlp_input = self.post_attention_layernorm(residual)
 
         # Apply modulated MLP
         mlp_output = self._apply_modulated_mlp(mlp_input, v_a, v_b)
-        
-        # Add residual connection AFTER MLP (preserving this connection)
-        hidden_states = residual + mlp_output
+
+        # Add MLP output to the hidden states (which already contains h + attention)
+        # Final output: h + attention + modulated_mlp(h)
+        hidden_states = hidden_states + mlp_output
         
         # Return format compatible with LlamaModel expectations
         # When not using cache or outputting attentions, just return the tensor
@@ -204,16 +208,16 @@ class NPTDecoderLayer(LlamaDecoderLayer):
 
         Efficiently processes all tokens at once using broadcasting.
         Handles both rank-1 and rank-k modulation.
-        
+
         Args:
             hidden_states: Input to MLP (batch_size, seq_len, hidden_size)
-            v_a: First vector from NP component 
+            v_a: First vector from NP component
                  - rank-1: (batch_size, seq_len, hidden_size)
                  - rank-k: (batch_size, seq_len, num_ranks, hidden_size)
             v_b: Second vector from NP component
                  - rank-1: (batch_size, seq_len, intermediate_size)
                  - rank-k: (batch_size, seq_len, num_ranks, intermediate_size)
-        
+
         Returns:
             MLP output (batch_size, seq_len, hidden_size)
         """
@@ -221,17 +225,17 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         W_gate_base = self.mlp.gate_proj.weight  # (intermediate_size, hidden_size)
         W_up = self.mlp.up_proj.weight  # (intermediate_size, hidden_size)
         W_down = self.mlp.down_proj.weight  # (hidden_size, intermediate_size)
-        
+
         # Standard projections
         gate_base = F.linear(hidden_states, W_gate_base)  # (batch, seq, intermediate)
         up = F.linear(hidden_states, W_up)  # (batch, seq, intermediate)
-        
+
         # Check if rank-k (4D tensor) or rank-1 (3D tensor)
         if v_a.dim() == 3:
             # Original rank-1 modulation
             # v_a @ hidden_states element-wise: (batch, seq, hidden) * (batch, seq, hidden) -> sum -> (batch, seq)
             v_a_dot_h = torch.sum(v_a * hidden_states, dim=-1, keepdim=True)  # (batch, seq, 1)
-            
+
             # v_b * (v_a @ h): (batch, seq, intermediate) * (batch, seq, 1) -> (batch, seq, intermediate)
             modulation = v_b * v_a_dot_h
         else:
@@ -239,26 +243,26 @@ class NPTDecoderLayer(LlamaDecoderLayer):
             # v_a: (batch, seq, num_ranks, hidden_size)
             # hidden_states: (batch, seq, hidden_size) -> expand to (batch, seq, 1, hidden_size)
             h_expanded = hidden_states.unsqueeze(2)  # (batch, seq, 1, hidden_size)
-            
+
             # Compute all dot products at once
             # (batch, seq, num_ranks, hidden) * (batch, seq, 1, hidden) -> sum over hidden -> (batch, seq, num_ranks)
             v_a_dot_h = torch.sum(v_a * h_expanded, dim=-1, keepdim=True)  # (batch, seq, num_ranks, 1)
-            
+
             # Compute all modulations
             # v_b: (batch, seq, num_ranks, intermediate)
             # v_a_dot_h: (batch, seq, num_ranks, 1)
             modulations = v_b * v_a_dot_h  # (batch, seq, num_ranks, intermediate)
-            
+
             # Sum over all rank components
             modulation = torch.sum(modulations, dim=2)  # (batch, seq, intermediate)
-        
+
         # Apply modulation to gate projection
         gate_modulated = gate_base + modulation
-        
+
         # Rest of SwiGLU computation
         intermediate = F.silu(gate_modulated) * up
         output = F.linear(intermediate, W_down)
-        
+
         return output
     
     def get_npt_parameters(self):

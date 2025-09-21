@@ -180,7 +180,7 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                     )
                     attention_output = attn_outputs[0]
 
-                    # Process through MLP
+                    # Process through MLP with standard flow
                     hidden_after_attn = residual + attention_output
                     mlp_normed = layer.post_attention_layernorm(hidden_after_attn)
                     mlp_output = layer.mlp(mlp_normed)
@@ -277,8 +277,14 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                 # Get v_a, v_b from attention
                 v_a, v_b = layer.np_component(attention_output)
 
-                # CRITICAL: MLP modulation uses current propagated hidden states
-                mlp_input = layer.post_attention_layernorm(hidden_states)
+                # NEW ARCHITECTURE: MLP takes only residual h, not h+attention
+                # The residual before adding attention
+                mlp_residual = hidden_states
+                # Add attention to hidden states (restore residual connection)
+                hidden_states_with_attention = hidden_states + attention_output
+
+                # MLP gets normalized residual WITHOUT attention
+                mlp_input = layer.post_attention_layernorm(mlp_residual)
                 mlp_modulated = layer._apply_modulated_mlp(mlp_input, v_a, v_b)
 
                 # Store outputs for loss computation
@@ -299,8 +305,8 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                 if f"before_{i}" in teacher_states:
                     del teacher_states[f"before_{i}"]
 
-                # ALWAYS propagate NPT output to next layer
-                hidden_states = hidden_states + mlp_modulated
+                # Propagate h + attention + modulated_mlp to next layer
+                hidden_states = hidden_states_with_attention + mlp_modulated
 
             else:
                 # Non-NPT layer: normal forward
@@ -334,8 +340,9 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
         for layer_idx in self.layers_to_train:
             outputs = layer_outputs[layer_idx]
 
-            # Direct supervision: modulated MLP should output attn + MLP(h+attn)
-            target = outputs['teacher_attention'] + outputs['teacher_mlp_with_attention']
+            # NEW TARGET: modulated MLP(h) should output MLP(h+attn) directly
+            # Simpler because attention is preserved through residual
+            target = outputs['teacher_mlp_with_attention']
             direct_mlp_loss = F.mse_loss(outputs['mlp_modulated'], target)
 
             # Regularization on v_a and v_b
@@ -687,6 +694,141 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
         self.model.train()
         return metrics
 
+    def save_checkpoint(self, checkpoint_name: Optional[str] = None):
+        """
+        Save training checkpoint with multi-layer specific state.
+
+        Args:
+            checkpoint_name: Name for checkpoint (uses step if None)
+        """
+        if checkpoint_name is None:
+            checkpoint_name = f"checkpoint-{self.global_step}"
+
+        checkpoint_path = self.checkpoint_dir / checkpoint_name
+        checkpoint_path.mkdir(parents=True, exist_ok=True)
+
+        # Save model NPT weights
+        self.model.save_npt_weights(checkpoint_path / "npt_weights.pt")
+
+        # Save optimizer and scheduler state
+        training_state = {
+            'global_step': self.global_step,
+            'batch_count': self.batch_count,
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+        }
+        torch.save(training_state, checkpoint_path / "training_state.pt")
+
+        # Save multi-layer specific state
+        multi_layer_state = {
+            'layers_to_train': self.layers_to_train,
+            'curriculum_schedule': [
+                {
+                    'name': stage.name,
+                    'until_step': stage.until_step,
+                    'mixing_ratio': stage.mixing_ratio
+                }
+                for stage in self.curriculum_schedule
+            ],
+            'current_stage_index': self.current_stage_index,
+            'layer_weights': self.layer_weights,
+            'teacher_cache_hits': self.teacher_cache_hits,
+            'teacher_cache_misses': self.teacher_cache_misses,
+        }
+        torch.save(multi_layer_state, checkpoint_path / "multi_layer_state.pt")
+
+        # Save configuration
+        import json
+        config_dict = {
+            'model_name': self.config.model_name,
+            'batch_size': self.config.batch_size,
+            'learning_rate': self.config.learning_rate,
+            'max_steps': self.config.max_steps,
+            'gradient_accumulation_steps': self.config.gradient_accumulation_steps,
+            'mixed_precision': self.config.mixed_precision,
+            'gradient_clip_value': self.config.gradient_clip_value,
+        }
+        with open(checkpoint_path / "config.json", "w") as f:
+            json.dump(config_dict, f, indent=2)
+
+        logger.info(f"Complete checkpoint saved to {checkpoint_path}")
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """
+        Load training checkpoint with multi-layer specific state.
+
+        Args:
+            checkpoint_path: Path to checkpoint directory
+        """
+        from pathlib import Path
+        checkpoint_path = Path(checkpoint_path)
+
+        # Load model NPT weights
+        npt_weights_path = checkpoint_path / "npt_weights.pt"
+        if npt_weights_path.exists():
+            self.model.load_npt_weights(npt_weights_path)
+            logger.info(f"Loaded NPT weights from {npt_weights_path}")
+        else:
+            logger.error(f"NPT weights not found at {npt_weights_path}")
+            raise FileNotFoundError(f"NPT weights not found")
+
+        # Load training state
+        training_state_path = checkpoint_path / "training_state.pt"
+        if training_state_path.exists():
+            training_state = torch.load(training_state_path, map_location=self.device, weights_only=False)
+            self.global_step = training_state['global_step']
+            self.batch_count = training_state.get('batch_count', 0)
+
+            # Load optimizer state
+            self.optimizer.load_state_dict(training_state['optimizer_state_dict'])
+
+            # Load scheduler state if present
+            if self.scheduler and training_state.get('scheduler_state_dict'):
+                self.scheduler.load_state_dict(training_state['scheduler_state_dict'])
+
+            # Load scaler state if using mixed precision
+            if self.scaler and training_state.get('scaler_state_dict'):
+                self.scaler.load_state_dict(training_state['scaler_state_dict'])
+
+            logger.info(f"Loaded training state: step {self.global_step}")
+        else:
+            logger.warning(f"Training state not found at {training_state_path}")
+
+        # Load multi-layer specific state
+        multi_layer_state_path = checkpoint_path / "multi_layer_state.pt"
+        if multi_layer_state_path.exists():
+            multi_layer_state = torch.load(multi_layer_state_path, map_location='cpu', weights_only=False)
+
+            # Restore layers configuration
+            loaded_layers = multi_layer_state['layers_to_train']
+            if set(loaded_layers) != set(self.layers_to_train):
+                logger.warning(
+                    f"Layer mismatch: checkpoint has layers {loaded_layers}, "
+                    f"but config specifies {self.layers_to_train}. Using config layers."
+                )
+
+            # Restore curriculum state
+            self.current_stage_index = multi_layer_state['current_stage_index']
+            self.teacher_cache_hits = multi_layer_state.get('teacher_cache_hits', 0)
+            self.teacher_cache_misses = multi_layer_state.get('teacher_cache_misses', 0)
+
+            # Restore layer weights if compatible
+            if set(multi_layer_state['layer_weights'].keys()) == set(self.layer_weights.keys()):
+                self.layer_weights = multi_layer_state['layer_weights']
+            else:
+                logger.warning("Layer weights configuration mismatch, using config weights")
+
+            # Update current curriculum stage based on global_step
+            self._update_curriculum_stage()
+
+            logger.info(
+                f"Resumed from checkpoint at step {self.global_step}, "
+                f"curriculum stage: {self.current_stage.name if self.current_stage else 'None'}"
+            )
+        else:
+            logger.warning(f"Multi-layer state not found at {multi_layer_state_path}, using current configuration")
+
 
 def parse_args():
     """Parse command line arguments."""
@@ -938,6 +1080,12 @@ def parse_args():
         default=1000,
         help="Number of validation samples"
     )
+    parser.add_argument(
+        "--resume_from",
+        type=str,
+        default=None,
+        help="Path to checkpoint directory to resume training from"
+    )
 
     return parser.parse_args()
 
@@ -1182,9 +1330,28 @@ def main():
         layer_weights=layer_weights
     )
 
+    # Load checkpoint if resuming
+    if args.resume_from:
+        logger.info(f"\nResuming training from checkpoint: {args.resume_from}")
+        try:
+            trainer.load_checkpoint(args.resume_from)
+            logger.info(f"Successfully loaded checkpoint from step {trainer.global_step}")
+            logger.info(f"Current curriculum stage: {trainer.current_stage.name if trainer.current_stage else 'None'}")
+
+            # Check if training is already complete
+            if trainer.global_step >= args.max_steps:
+                logger.warning(f"Training already complete (step {trainer.global_step} >= {args.max_steps})")
+                logger.warning("If you want to continue training, increase --max_steps")
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint: {e}")
+            raise
+
     # Start training
     logger.info("\n" + "=" * 80)
-    logger.info("Starting Multi-Layer NPT Training")
+    if args.resume_from:
+        logger.info(f"Resuming Multi-Layer NPT Training from step {trainer.global_step}")
+    else:
+        logger.info("Starting Multi-Layer NPT Training")
     logger.info("=" * 80)
     logger.info(f"Training Configuration:")
     logger.info(f"  Model: {args.model_name} ({args.model_size})")
@@ -1192,7 +1359,11 @@ def main():
     logger.info(f"  NPT Rank: {args.np_rank}")
     logger.info(f"  Num Ranks (rank-k): {args.num_ranks}")
     logger.info(f"  Total Steps: {args.max_steps}")
+    logger.info(f"  Current Step: {trainer.global_step}")
+    logger.info(f"  Remaining Steps: {args.max_steps - trainer.global_step}")
     logger.info(f"  Curriculum: {[s.name for s in curriculum_schedule]}")
+    if trainer.current_stage:
+        logger.info(f"  Current Stage: {trainer.current_stage.name}")
     logger.info(f"  Gradient Scale Factor: {args.gradient_scale_factor}x")
     logger.info(f"  Direct MLP Weight: {args.direct_mlp_weight}")
     logger.info(f"  Fidelity Weight: {args.fidelity_weight}")

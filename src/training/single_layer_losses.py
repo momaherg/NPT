@@ -24,13 +24,13 @@ class SingleLayerLossOutput:
 
 class DirectMLPSupervisionLoss(nn.Module):
     """
-    Core loss for single-layer NPT training.
+    Core loss for single-layer NPT training (NEW ARCHITECTURE).
 
     This loss directly supervises what the modulated MLP should output:
-    MLP_mod(h) = attn + MLP(h + attn)
+    MLP_mod(h) = MLP(h + attn)
 
-    This is THE CRITICAL LOSS for single-layer training as it provides
-    direct supervision on the exact transformation needed.
+    With the restored attention residual, the modulation only needs to
+    capture how attention affects MLP computation, not recover attention itself.
     """
 
     def __init__(self, normalize: bool = True):
@@ -44,18 +44,19 @@ class DirectMLPSupervisionLoss(nn.Module):
         original_mlp_with_attention: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute direct MLP supervision loss.
+        Compute direct MLP supervision loss (NEW ARCHITECTURE).
 
         Args:
             mlp_modulated_output: Output from modulated MLP(h)
-            attention_output: Attention output that was lost without residual
+            attention_output: Attention output (now preserved via residual)
             original_mlp_with_attention: Original MLP(h + attn) output
 
         Returns:
             Direct supervision loss
         """
-        # The target is what the modulated MLP should produce
-        target = attention_output + original_mlp_with_attention
+        # NEW TARGET: modulated MLP(h) should directly match MLP(h + attn)
+        # No need to add attention since it's preserved through residual
+        target = original_mlp_with_attention
 
         if self.normalize:
             # Normalize by magnitude to handle scale differences
@@ -69,12 +70,12 @@ class DirectMLPSupervisionLoss(nn.Module):
 
 class DirectSupervisionLoss(nn.Module):
     """
-    Primary loss for single-layer NPT training focusing on direct MLP supervision.
+    Primary loss for single-layer NPT training (NEW ARCHITECTURE).
 
-    This loss directly trains the modulated MLP to output what's needed:
-    MLP_mod(h) = attn + MLP(h + attn)
+    This loss trains the modulated MLP to output:
+    MLP_mod(h) = MLP(h + attn)
 
-    The model learns to encode attention in v_a naturally to minimize this loss.
+    The modulation learns how attention affects MLP computation.
     """
 
     def __init__(

@@ -8,6 +8,7 @@ can be converted to NPT layers while others remain standard.
 import torch
 import torch.nn as nn
 from typing import List, Optional, Union, Dict, Any
+from pathlib import Path
 from transformers import LlamaForCausalLM, LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from copy import deepcopy
@@ -297,13 +298,13 @@ class NPTLlamaModel(LlamaForCausalLM):
     def load_npt_weights(self, weights_or_path: Union[str, Dict[str, torch.Tensor]]):
         """
         Load NP component weights.
-        
+
         Args:
             weights_or_path: Either a path to load weights from or a dictionary of weights
         """
         # Load weights if path is provided
-        if isinstance(weights_or_path, str):
-            npt_state_dict = torch.load(weights_or_path, map_location='cpu')
+        if isinstance(weights_or_path, (str, Path)):
+            npt_state_dict = torch.load(weights_or_path, map_location='cpu', weights_only=False)
             print(f"Loaded NPT weights from {weights_or_path}")
         else:
             npt_state_dict = weights_or_path
