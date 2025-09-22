@@ -29,6 +29,7 @@ class NPTConfig:
         single_layer_mode: bool = False,
         num_ranks: int = 1,  # NEW: number of rank-1 components for rank-k updates
         init_strategy: str = "improved",  # NEW: initialization strategy
+        dual_modulation: bool = True,  # NEW: dual gate/up modulation
     ):
         """
         Initialize NPT configuration.
@@ -50,6 +51,7 @@ class NPTConfig:
         self.single_layer_mode = single_layer_mode
         self.num_ranks = num_ranks
         self.init_strategy = init_strategy
+        self.dual_modulation = dual_modulation
         
         # Validate configuration
         if sum([layers_to_convert is not None, 
@@ -167,6 +169,7 @@ class NPTLlamaModel(LlamaForCausalLM):
         self.config.single_layer_mode = npt_config.single_layer_mode
         self.config.num_ranks = npt_config.num_ranks
         self.config.init_strategy = npt_config.init_strategy
+        self.config.dual_modulation = npt_config.dual_modulation
         
         # Get layers to convert
         num_layers = len(self.model.layers)

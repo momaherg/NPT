@@ -35,8 +35,9 @@ class NPComponent(nn.Module):
         single_layer_mode: bool = False,
         num_ranks: int = 1,  # NEW: number of rank-1 components for rank-k updates
         init_strategy: str = "improved",  # NEW: "improved" or "conservative"
+        dual_modulation: bool = True,  # NEW: Generate separate modulations for gate and up
     ):
-        print(f"      [NPComponent] Initializing with d_model={d_model}, d_ffn={d_ffn}, rank={rank}, num_ranks={num_ranks}")
+        print(f"      [NPComponent] Initializing with d_model={d_model}, d_ffn={d_ffn}, rank={rank}, num_ranks={num_ranks}, dual={dual_modulation}")
         super().__init__()
 
         self.d_model = d_model
@@ -44,6 +45,7 @@ class NPComponent(nn.Module):
         self.single_layer_mode = single_layer_mode
         self.num_ranks = num_ranks
         self.init_strategy = init_strategy
+        self.dual_modulation = dual_modulation
 
         # Always use the user-specified rank
         self.rank = rank
@@ -55,25 +57,64 @@ class NPComponent(nn.Module):
             self.init_scale = init_scale
         
         # Create weight matrices - backward compatible structure
-        if num_ranks == 1:
-            # Original single rank-1: use Parameters directly for backward compatibility
-            self.W_down = nn.Parameter(torch.empty(d_model, self.rank))
-            self.W_a_up = nn.Parameter(torch.empty(self.rank, d_model))
-            self.W_b_up = nn.Parameter(torch.empty(self.rank, d_ffn))
+        if dual_modulation:
+            # Dual modulation: separate weights for gate and up projections
+            if num_ranks == 1:
+                # Gate modulation weights
+                self.W_down_gate = nn.Parameter(torch.empty(d_model, self.rank))
+                self.W_a_up_gate = nn.Parameter(torch.empty(self.rank, d_model))
+                self.W_b_up_gate = nn.Parameter(torch.empty(self.rank, d_ffn))
+
+                # Up modulation weights
+                self.W_down_up = nn.Parameter(torch.empty(d_model, self.rank))
+                self.W_a_up_up = nn.Parameter(torch.empty(self.rank, d_model))
+                self.W_b_up_up = nn.Parameter(torch.empty(self.rank, d_ffn))
+            else:
+                # Multiple rank-1 components for each projection
+                self.W_down_gate = nn.ParameterList([
+                    nn.Parameter(torch.empty(d_model, self.rank))
+                    for _ in range(num_ranks)
+                ])
+                self.W_a_up_gate = nn.ParameterList([
+                    nn.Parameter(torch.empty(self.rank, d_model))
+                    for _ in range(num_ranks)
+                ])
+                self.W_b_up_gate = nn.ParameterList([
+                    nn.Parameter(torch.empty(self.rank, d_ffn))
+                    for _ in range(num_ranks)
+                ])
+
+                self.W_down_up = nn.ParameterList([
+                    nn.Parameter(torch.empty(d_model, self.rank))
+                    for _ in range(num_ranks)
+                ])
+                self.W_a_up_up = nn.ParameterList([
+                    nn.Parameter(torch.empty(self.rank, d_model))
+                    for _ in range(num_ranks)
+                ])
+                self.W_b_up_up = nn.ParameterList([
+                    nn.Parameter(torch.empty(self.rank, d_ffn))
+                    for _ in range(num_ranks)
+                ])
         else:
-            # Multiple rank-1 components: use ParameterLists
-            self.W_down = nn.ParameterList([
-                nn.Parameter(torch.empty(d_model, self.rank))
-                for _ in range(num_ranks)
-            ])
-            self.W_a_up = nn.ParameterList([
-                nn.Parameter(torch.empty(self.rank, d_model))
-                for _ in range(num_ranks)
-            ])
-            self.W_b_up = nn.ParameterList([
-                nn.Parameter(torch.empty(self.rank, d_ffn))
-                for _ in range(num_ranks)
-            ])
+            # Original single modulation (backward compatibility)
+            if num_ranks == 1:
+                self.W_down = nn.Parameter(torch.empty(d_model, self.rank))
+                self.W_a_up = nn.Parameter(torch.empty(self.rank, d_model))
+                self.W_b_up = nn.Parameter(torch.empty(self.rank, d_ffn))
+            else:
+                self.W_down = nn.ParameterList([
+                    nn.Parameter(torch.empty(d_model, self.rank))
+                    for _ in range(num_ranks)
+                ])
+                self.W_a_up = nn.ParameterList([
+                    nn.Parameter(torch.empty(self.rank, d_model))
+                    for _ in range(num_ranks)
+                ])
+                self.W_b_up = nn.ParameterList([
+                    nn.Parameter(torch.empty(self.rank, d_ffn))
+                    for _ in range(num_ranks)
+                ])
 
         # Initialize weights
         self._initialize_weights()
@@ -82,11 +123,25 @@ class NPComponent(nn.Module):
         """
         Initialize weights with small values to ensure low-magnitude updates initially.
         Uses a scaled uniform initialization to encourage stable training.
-        
+
         For single-layer mode, uses special initialization to help v_a encode attention
         and v_b start with minimal modulation.
         """
-        if self.num_ranks == 1:
+        if self.dual_modulation:
+            # Initialize dual modulation weights
+            self._init_modulation_weights(
+                'gate',
+                self.W_down_gate if self.num_ranks == 1 else self.W_down_gate,
+                self.W_a_up_gate if self.num_ranks == 1 else self.W_a_up_gate,
+                self.W_b_up_gate if self.num_ranks == 1 else self.W_b_up_gate
+            )
+            self._init_modulation_weights(
+                'up',
+                self.W_down_up if self.num_ranks == 1 else self.W_down_up,
+                self.W_a_up_up if self.num_ranks == 1 else self.W_a_up_up,
+                self.W_b_up_up if self.num_ranks == 1 else self.W_b_up_up
+            )
+        elif self.num_ranks == 1:
             # Original rank-1 initialization
             if self.single_layer_mode:
                 # Special initialization for single-layer NPT
@@ -200,33 +255,89 @@ class NPComponent(nn.Module):
                         nn.init.uniform_(self.W_a_up[i], -self.init_scale, self.init_scale)
                         nn.init.uniform_(self.W_b_up[i], -self.init_scale, self.init_scale)
     
+    def _init_modulation_weights(self, name, W_down, W_a_up, W_b_up):
+        """Initialize a set of modulation weights."""
+        if self.num_ranks == 1:
+            # Single rank initialization
+            if self.single_layer_mode:
+                nn.init.xavier_uniform_(W_down)
+                if self.init_strategy == "improved":
+                    if self.rank <= self.d_model:
+                        eye = torch.eye(self.rank, self.d_model)
+                        W_a_up.data = eye[:self.rank, :self.d_model] * 0.5
+                        W_a_up.data += torch.randn(self.rank, self.d_model) * 0.05
+                    else:
+                        num_repeats = (self.rank + self.d_model - 1) // self.d_model
+                        eye = torch.eye(self.d_model)
+                        repeated = eye.repeat(num_repeats, 1)[:self.rank, :]
+                        W_a_up.data = repeated * 0.5
+                        W_a_up.data += torch.randn(self.rank, self.d_model) * 0.05
+                    std = (2.0 / (self.rank + self.d_ffn)) ** 0.5
+                    nn.init.normal_(W_b_up, mean=0.0, std=std * 0.05)
+                else:
+                    nn.init.uniform_(W_a_up, -self.init_scale, self.init_scale)
+                    nn.init.uniform_(W_b_up, -self.init_scale, self.init_scale)
+            else:
+                nn.init.xavier_uniform_(W_down)
+                nn.init.uniform_(W_a_up, -self.init_scale, self.init_scale)
+                nn.init.uniform_(W_b_up, -self.init_scale, self.init_scale)
+        else:
+            # Multi-rank initialization
+            for i in range(self.num_ranks):
+                nn.init.xavier_uniform_(W_down[i])
+                if i > 0:
+                    nn.init.orthogonal_(W_a_up[i], gain=self.init_scale)
+                    nn.init.orthogonal_(W_b_up[i], gain=self.init_scale * 0.1)
+                else:
+                    nn.init.uniform_(W_a_up[i], -self.init_scale, self.init_scale)
+                    nn.init.uniform_(W_b_up[i], -self.init_scale, self.init_scale)
+
     def forward(self, attn_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate v_a and v_b vectors from attention output.
-        
+
         Args:
             attn_output: Attention output tensor of shape (batch_size, seq_len, d_model)
-        
+
         Returns:
-            Tuple of (v_a, v_b) where:
-            - For num_ranks=1: v_a has shape (batch_size, seq_len, d_model)
-                               v_b has shape (batch_size, seq_len, d_ffn)
-            - For num_ranks>1: v_a has shape (batch_size, seq_len, num_ranks, d_model)
-                               v_b has shape (batch_size, seq_len, num_ranks, d_ffn)
+            For dual_modulation=True:
+                Tuple of ((v_a_gate, v_b_gate), (v_a_up, v_b_up))
+            For dual_modulation=False:
+                Tuple of (v_a, v_b)
         """
+        if self.dual_modulation:
+            # Generate separate modulations for gate and up projections
+            v_a_gate, v_b_gate = self._compute_modulation(
+                attn_output,
+                self.W_down_gate, self.W_a_up_gate, self.W_b_up_gate
+            )
+            v_a_up, v_b_up = self._compute_modulation(
+                attn_output,
+                self.W_down_up, self.W_a_up_up, self.W_b_up_up
+            )
+            return (v_a_gate, v_b_gate), (v_a_up, v_b_up)
+        else:
+            # Original single modulation
+            return self._compute_modulation(
+                attn_output,
+                self.W_down, self.W_a_up, self.W_b_up
+            )
+
+    def _compute_modulation(self, attn_output, W_down, W_a_up, W_b_up):
+        """Compute a single modulation (v_a, v_b) pair."""
         if self.num_ranks == 1:
             # Original rank-1 implementation
             # Project to low-rank space
             # (batch_size, seq_len, d_model) @ (d_model, rank) -> (batch_size, seq_len, rank)
-            intermediate_r = attn_output @ self.W_down
-            
+            intermediate_r = attn_output @ W_down
+
             # Generate v_a: project back to model dimension
             # (batch_size, seq_len, rank) @ (rank, d_model) -> (batch_size, seq_len, d_model)
-            v_a = intermediate_r @ self.W_a_up
-            
+            v_a = intermediate_r @ W_a_up
+
             # Generate v_b: project to FFN dimension
             # (batch_size, seq_len, rank) @ (rank, d_ffn) -> (batch_size, seq_len, d_ffn)
-            v_b = intermediate_r @ self.W_b_up
+            v_b = intermediate_r @ W_b_up
             
             return v_a, v_b
         else:
@@ -234,9 +345,9 @@ class NPComponent(nn.Module):
             if self.num_ranks > 16:
                 # For many components, batch the operations for efficiency using einsum
                 # Stack all weight matrices
-                W_down_stacked = torch.stack([w for w in self.W_down], dim=0)  # (num_ranks, d_model, rank)
-                W_a_up_stacked = torch.stack([w for w in self.W_a_up], dim=0)  # (num_ranks, rank, d_model)
-                W_b_up_stacked = torch.stack([w for w in self.W_b_up], dim=0)  # (num_ranks, rank, d_ffn)
+                W_down_stacked = torch.stack([w for w in W_down], dim=0)  # (num_ranks, d_model, rank)
+                W_a_up_stacked = torch.stack([w for w in W_a_up], dim=0)  # (num_ranks, rank, d_model)
+                W_b_up_stacked = torch.stack([w for w in W_b_up], dim=0)  # (num_ranks, rank, d_ffn)
 
                 # Use einsum for efficient batched matrix multiplication
                 # attn_output: (batch, seq, d_model)
@@ -260,9 +371,9 @@ class NPComponent(nn.Module):
 
                 for i in range(self.num_ranks):
                     # Each component has its own bottleneck
-                    intermediate_r = attn_output @ self.W_down[i]
-                    v_a_i = intermediate_r @ self.W_a_up[i]
-                    v_b_i = intermediate_r @ self.W_b_up[i]
+                    intermediate_r = attn_output @ W_down[i]
+                    v_a_i = intermediate_r @ W_a_up[i]
+                    v_b_i = intermediate_r @ W_b_up[i]
 
                     v_a_list.append(v_a_i)
                     v_b_list.append(v_b_i)

@@ -50,11 +50,21 @@ class MultiLayerNPTContextTransfer:
         self.device = device
         self.transfer_mode = transfer_mode  # "last", "last_n", or "avg_last"
         
-        # Storage for captured v_a, v_b per layer
-        self.captured_v_a = {}  # layer_idx -> tensor
-        self.captured_v_b = {}  # layer_idx -> tensor
-        self.override_v_a = {}  # layer_idx -> tensor  
-        self.override_v_b = {}  # layer_idx -> tensor
+        # Storage for captured modulations per layer
+        # For dual modulation: stores gate and up separately
+        # For single modulation: stores in 'gate' keys for backward compatibility
+        self.captured_v_a_gate = {}  # layer_idx -> tensor
+        self.captured_v_b_gate = {}  # layer_idx -> tensor
+        self.captured_v_a_up = {}    # layer_idx -> tensor (None for single modulation)
+        self.captured_v_b_up = {}    # layer_idx -> tensor (None for single modulation)
+
+        self.override_v_a_gate = {}  # layer_idx -> tensor
+        self.override_v_b_gate = {}  # layer_idx -> tensor
+        self.override_v_a_up = {}    # layer_idx -> tensor (None for single modulation)
+        self.override_v_b_up = {}    # layer_idx -> tensor (None for single modulation)
+
+        # Track modulation type per layer
+        self.is_dual_modulation = {}  # layer_idx -> bool
         
         # Hook handles per layer
         self.hook_handles = {}
@@ -81,69 +91,116 @@ class MultiLayerNPTContextTransfer:
                 """Create a hook function for a specific layer index."""
                 
                 def hook_fn(module, input, output):
-                    """Hook that captures or overrides v_a, v_b for this layer."""
+                    """Hook that captures or overrides modulations for this layer."""
+
+                    # Check if dual modulation (nested tuple structure)
+                    is_dual = (isinstance(output, tuple) and len(output) == 2 and
+                              isinstance(output[0], tuple) and isinstance(output[1], tuple))
+
+                    # Store modulation type for this layer
+                    self.is_dual_modulation[idx] = is_dual
 
                     # Check if we should override for this layer
-                    if idx in self.override_v_a and idx in self.override_v_b:
+                    if idx in self.override_v_a_gate and idx in self.override_v_b_gate:
                         # Override mode - replace modulation
-                        if isinstance(output, tuple) and len(output) == 2:
-                            # Get original computed v_a, v_b
-                            computed_v_a = output[0]
-                            computed_v_b = output[1]
-
-                            # Check if rank-k (4D) or rank-1 (3D)
-                            is_rank_k = computed_v_a.dim() == 4
-
-                            if is_rank_k:
-                                batch_size, seq_len, num_ranks, hidden_size = computed_v_a.shape
-                            else:
-                                batch_size, seq_len, hidden_size = computed_v_a.shape
+                        if is_dual:
+                            # Dual modulation: ((v_a_gate, v_b_gate), (v_a_up, v_b_up))
+                            (computed_v_a_gate, computed_v_b_gate), (computed_v_a_up, computed_v_b_up) = output
+                            is_rank_k = computed_v_a_gate.dim() == 4
+                        else:
+                            # Single modulation: (v_a, v_b)
+                            computed_v_a_gate = output[0]
+                            computed_v_b_gate = output[1]
+                            computed_v_a_up = None
+                            computed_v_b_up = None
+                            is_rank_k = computed_v_a_gate.dim() == 4
 
                             # Clone to avoid modifying the original
-                            new_v_a = computed_v_a.clone()
-                            new_v_b = computed_v_b.clone()
+                            new_v_a_gate = computed_v_a_gate.clone()
+                            new_v_b_gate = computed_v_b_gate.clone()
+                            new_v_a_up = computed_v_a_up.clone() if computed_v_a_up is not None else None
+                            new_v_b_up = computed_v_b_up.clone() if computed_v_b_up is not None else None
 
                             if self.transfer_mode == "last":
                                 # Replace ONLY the last token's modulation
                                 if is_rank_k:
-                                    new_v_a[:, -1, :, :] = self.override_v_a[idx][:, -1, :, :]
-                                    new_v_b[:, -1, :, :] = self.override_v_b[idx][:, -1, :, :]
+                                    new_v_a_gate[:, -1, :, :] = self.override_v_a_gate[idx][:, -1, :, :]
+                                    new_v_b_gate[:, -1, :, :] = self.override_v_b_gate[idx][:, -1, :, :]
+                                    if new_v_a_up is not None and idx in self.override_v_a_up:
+                                        new_v_a_up[:, -1, :, :] = self.override_v_a_up[idx][:, -1, :, :]
+                                        new_v_b_up[:, -1, :, :] = self.override_v_b_up[idx][:, -1, :, :]
                                 else:
-                                    new_v_a[:, -1, :] = self.override_v_a[idx][:, -1, :]
-                                    new_v_b[:, -1, :] = self.override_v_b[idx][:, -1, :]
+                                    new_v_a_gate[:, -1, :] = self.override_v_a_gate[idx][:, -1, :]
+                                    new_v_b_gate[:, -1, :] = self.override_v_b_gate[idx][:, -1, :]
+                                    if new_v_a_up is not None and idx in self.override_v_a_up:
+                                        new_v_a_up[:, -1, :] = self.override_v_a_up[idx][:, -1, :]
+                                        new_v_b_up[:, -1, :] = self.override_v_b_up[idx][:, -1, :]
                             elif self.transfer_mode == "last_n":
                                 # Replace the last N tokens
-                                n_tokens = min(3, seq_len, self.override_v_a[idx].shape[1])
+                                n_tokens = min(3, computed_v_a_gate.shape[1], self.override_v_a_gate[idx].shape[1])
                                 if is_rank_k:
-                                    new_v_a[:, -n_tokens:, :, :] = self.override_v_a[idx][:, -n_tokens:, :, :]
-                                    new_v_b[:, -n_tokens:, :, :] = self.override_v_b[idx][:, -n_tokens:, :, :]
+                                    new_v_a_gate[:, -n_tokens:, :, :] = self.override_v_a_gate[idx][:, -n_tokens:, :, :]
+                                    new_v_b_gate[:, -n_tokens:, :, :] = self.override_v_b_gate[idx][:, -n_tokens:, :, :]
+                                    if new_v_a_up is not None and idx in self.override_v_a_up:
+                                        new_v_a_up[:, -n_tokens:, :, :] = self.override_v_a_up[idx][:, -n_tokens:, :, :]
+                                        new_v_b_up[:, -n_tokens:, :, :] = self.override_v_b_up[idx][:, -n_tokens:, :, :]
                                 else:
-                                    new_v_a[:, -n_tokens:, :] = self.override_v_a[idx][:, -n_tokens:, :]
-                                    new_v_b[:, -n_tokens:, :] = self.override_v_b[idx][:, -n_tokens:, :]
+                                    new_v_a_gate[:, -n_tokens:, :] = self.override_v_a_gate[idx][:, -n_tokens:, :]
+                                    new_v_b_gate[:, -n_tokens:, :] = self.override_v_b_gate[idx][:, -n_tokens:, :]
+                                    if new_v_a_up is not None and idx in self.override_v_a_up:
+                                        new_v_a_up[:, -n_tokens:, :] = self.override_v_a_up[idx][:, -n_tokens:, :]
+                                        new_v_b_up[:, -n_tokens:, :] = self.override_v_b_up[idx][:, -n_tokens:, :]
                             elif self.transfer_mode == "avg_last":
                                 # Use average of last few tokens from context
                                 if is_rank_k:
-                                    avg_v_a = self.override_v_a[idx][:, -5:, :, :].mean(dim=1)
-                                    avg_v_b = self.override_v_b[idx][:, -5:, :, :].mean(dim=1)
-                                    new_v_a[:, -1, :, :] = avg_v_a
-                                    new_v_b[:, -1, :, :] = avg_v_b
+                                    avg_v_a_gate = self.override_v_a_gate[idx][:, -5:, :, :].mean(dim=1)
+                                    avg_v_b_gate = self.override_v_b_gate[idx][:, -5:, :, :].mean(dim=1)
+                                    new_v_a_gate[:, -1, :, :] = avg_v_a_gate
+                                    new_v_b_gate[:, -1, :, :] = avg_v_b_gate
+                                    if new_v_a_up is not None and idx in self.override_v_a_up:
+                                        avg_v_a_up = self.override_v_a_up[idx][:, -5:, :, :].mean(dim=1)
+                                        avg_v_b_up = self.override_v_b_up[idx][:, -5:, :, :].mean(dim=1)
+                                        new_v_a_up[:, -1, :, :] = avg_v_a_up
+                                        new_v_b_up[:, -1, :, :] = avg_v_b_up
                                 else:
-                                    avg_v_a = self.override_v_a[idx][:, -5:, :].mean(dim=1)
-                                    avg_v_b = self.override_v_b[idx][:, -5:, :].mean(dim=1)
-                                    new_v_a[:, -1, :] = avg_v_a
-                                    new_v_b[:, -1, :] = avg_v_b
+                                    avg_v_a_gate = self.override_v_a_gate[idx][:, -5:, :].mean(dim=1)
+                                    avg_v_b_gate = self.override_v_b_gate[idx][:, -5:, :].mean(dim=1)
+                                    new_v_a_gate[:, -1, :] = avg_v_a_gate
+                                    new_v_b_gate[:, -1, :] = avg_v_b_gate
+                                    if new_v_a_up is not None and idx in self.override_v_a_up:
+                                        avg_v_a_up = self.override_v_a_up[idx][:, -5:, :].mean(dim=1)
+                                        avg_v_b_up = self.override_v_b_up[idx][:, -5:, :].mean(dim=1)
+                                        new_v_a_up[:, -1, :] = avg_v_a_up
+                                        new_v_b_up[:, -1, :] = avg_v_b_up
 
                             # Store the modified versions for analysis
-                            self.captured_v_a[idx] = new_v_a.detach().clone()
-                            self.captured_v_b[idx] = new_v_b.detach().clone()
+                            self.captured_v_a_gate[idx] = new_v_a_gate.detach().clone()
+                            self.captured_v_b_gate[idx] = new_v_b_gate.detach().clone()
+                            if new_v_a_up is not None:
+                                self.captured_v_a_up[idx] = new_v_a_up.detach().clone()
+                                self.captured_v_b_up[idx] = new_v_b_up.detach().clone()
 
-                            return (new_v_a, new_v_b)
+                            # Return in appropriate format
+                            if is_dual:
+                                return ((new_v_a_gate, new_v_b_gate), (new_v_a_up, new_v_b_up))
+                            else:
+                                return (new_v_a_gate, new_v_b_gate)
                     
                     # Capture mode - just store the values
+                    elif is_dual:
+                        # Dual modulation: ((v_a_gate, v_b_gate), (v_a_up, v_b_up))
+                        (v_a_gate, v_b_gate), (v_a_up, v_b_up) = output
+                        self.captured_v_a_gate[idx] = v_a_gate.detach().clone()
+                        self.captured_v_b_gate[idx] = v_b_gate.detach().clone()
+                        self.captured_v_a_up[idx] = v_a_up.detach().clone()
+                        self.captured_v_b_up[idx] = v_b_up.detach().clone()
                     elif isinstance(output, tuple) and len(output) == 2:
-                        self.captured_v_a[idx] = output[0].detach().clone()
-                        self.captured_v_b[idx] = output[1].detach().clone()
-                    
+                        # Single modulation: (v_a, v_b)
+                        self.captured_v_a_gate[idx] = output[0].detach().clone()
+                        self.captured_v_b_gate[idx] = output[1].detach().clone()
+                        self.captured_v_a_up[idx] = None
+                        self.captured_v_b_up[idx] = None
+
                     return output
                 
                 return hook_fn
@@ -156,25 +213,44 @@ class MultiLayerNPTContextTransfer:
     
     def clear_captured(self):
         """Clear all captured modulations."""
-        self.captured_v_a.clear()
-        self.captured_v_b.clear()
+        self.captured_v_a_gate.clear()
+        self.captured_v_b_gate.clear()
+        self.captured_v_a_up.clear()
+        self.captured_v_b_up.clear()
     
     def clear_overrides(self):
         """Clear all override modulations."""
-        self.override_v_a.clear()
-        self.override_v_b.clear()
+        self.override_v_a_gate.clear()
+        self.override_v_b_gate.clear()
+        self.override_v_a_up.clear()
+        self.override_v_b_up.clear()
     
-    def set_overrides(self, override_dict: Dict[int, Tuple[torch.Tensor, torch.Tensor]]):
+    def set_overrides(self, override_dict: Dict):
         """
         Set override modulations for specific layers.
-        
+
         Args:
-            override_dict: Dictionary mapping layer_idx to (v_a, v_b) tuples
+            override_dict: Dictionary with structure:
+                          - For dual: {layer_idx: {'gate': (v_a_gate, v_b_gate), 'up': (v_a_up, v_b_up)}}
+                          - For single: {layer_idx: (v_a, v_b)} or {layer_idx: {'gate': (v_a, v_b)}}
         """
         self.clear_overrides()
-        for layer_idx, (v_a, v_b) in override_dict.items():
-            self.override_v_a[layer_idx] = v_a
-            self.override_v_b[layer_idx] = v_b
+        for layer_idx, modulation in override_dict.items():
+            if isinstance(modulation, dict):
+                # Dual modulation format
+                if 'gate' in modulation:
+                    v_a_gate, v_b_gate = modulation['gate']
+                    self.override_v_a_gate[layer_idx] = v_a_gate
+                    self.override_v_b_gate[layer_idx] = v_b_gate
+                if 'up' in modulation:
+                    v_a_up, v_b_up = modulation['up']
+                    self.override_v_a_up[layer_idx] = v_a_up
+                    self.override_v_b_up[layer_idx] = v_b_up
+            else:
+                # Single modulation format (backward compatibility)
+                v_a, v_b = modulation
+                self.override_v_a_gate[layer_idx] = v_a
+                self.override_v_b_gate[layer_idx] = v_b
     
     def get_token_probabilities(self, prompt: str, target_tokens: List[str]) -> Dict[str, float]:
         """
@@ -262,14 +338,24 @@ class MultiLayerNPTContextTransfer:
         baseline_response = self.generate_response(no_context_prompt)
         baseline_probs = self.get_token_probabilities(no_context_prompt, target_tokens)
         
-        # Store baseline v_a, v_b for all layers
+        # Store baseline modulations for all layers
         baseline_modulations = {}
         for layer_idx in self.layer_indices:
-            if layer_idx in self.captured_v_a:
-                baseline_modulations[layer_idx] = (
-                    self.captured_v_a[layer_idx].clone(),
-                    self.captured_v_b[layer_idx].clone()
-                )
+            if layer_idx in self.captured_v_a_gate:
+                if self.captured_v_a_up.get(layer_idx) is not None:
+                    # Dual modulation
+                    baseline_modulations[layer_idx] = {
+                        'gate': (self.captured_v_a_gate[layer_idx].clone(),
+                                self.captured_v_b_gate[layer_idx].clone()),
+                        'up': (self.captured_v_a_up[layer_idx].clone(),
+                              self.captured_v_b_up[layer_idx].clone())
+                    }
+                else:
+                    # Single modulation
+                    baseline_modulations[layer_idx] = (
+                        self.captured_v_a_gate[layer_idx].clone(),
+                        self.captured_v_b_gate[layer_idx].clone()
+                    )
         
         print(f"Response: {Fore.GREEN}{baseline_response}{Style.RESET_ALL}")
         print(f"Token Probabilities:")
@@ -278,15 +364,36 @@ class MultiLayerNPTContextTransfer:
         
         print(f"\nCaptured modulations from layers:")
         for layer_idx in sorted(baseline_modulations.keys()):
-            v_a, v_b = baseline_modulations[layer_idx]
-            # Handle both rank-1 and rank-k
-            if v_a.dim() == 4:  # rank-k
-                v_a_norm = v_a.norm(dim=(-2, -1)).mean().item()  # Average across batch/seq
-                v_b_norm = v_b.norm(dim=(-2, -1)).mean().item()
-                num_ranks = v_a.shape[2]
-                print(f"  Layer {layer_idx}: v_a norm={v_a_norm:.4f}, v_b norm={v_b_norm:.4f} (rank-{num_ranks})")
-            else:  # rank-1
-                print(f"  Layer {layer_idx}: v_a norm={v_a.norm():.4f}, v_b norm={v_b.norm():.4f}")
+            modulation = baseline_modulations[layer_idx]
+            if isinstance(modulation, dict):
+                # Dual modulation
+                v_a_gate, v_b_gate = modulation['gate']
+                v_a_up, v_b_up = modulation['up']
+
+                # Handle rank-k vs rank-1
+                if v_a_gate.dim() == 4:  # rank-k
+                    v_a_gate_norm = v_a_gate.norm(dim=(-2, -1)).mean().item()
+                    v_b_gate_norm = v_b_gate.norm(dim=(-2, -1)).mean().item()
+                    v_a_up_norm = v_a_up.norm(dim=(-2, -1)).mean().item()
+                    v_b_up_norm = v_b_up.norm(dim=(-2, -1)).mean().item()
+                    num_ranks = v_a_gate.shape[2]
+                    print(f"  Layer {layer_idx} (dual, rank-{num_ranks}):")
+                    print(f"    Gate: v_a={v_a_gate_norm:.4f}, v_b={v_b_gate_norm:.4f}")
+                    print(f"    Up:   v_a={v_a_up_norm:.4f}, v_b={v_b_up_norm:.4f}")
+                else:  # rank-1
+                    print(f"  Layer {layer_idx} (dual):")
+                    print(f"    Gate: v_a={v_a_gate.norm():.4f}, v_b={v_b_gate.norm():.4f}")
+                    print(f"    Up:   v_a={v_a_up.norm():.4f}, v_b={v_b_up.norm():.4f}")
+            else:
+                # Single modulation
+                v_a, v_b = modulation
+                if v_a.dim() == 4:  # rank-k
+                    v_a_norm = v_a.norm(dim=(-2, -1)).mean().item()
+                    v_b_norm = v_b.norm(dim=(-2, -1)).mean().item()
+                    num_ranks = v_a.shape[2]
+                    print(f"  Layer {layer_idx} (single, rank-{num_ranks}): v_a={v_a_norm:.4f}, v_b={v_b_norm:.4f}")
+                else:  # rank-1
+                    print(f"  Layer {layer_idx} (single): v_a={v_a.norm():.4f}, v_b={v_b.norm():.4f}")
         
         # ========== Run 2: With false context ==========
         print(f"\n{Fore.YELLOW}Run 2: With False Context{Style.RESET_ALL}")
@@ -300,14 +407,24 @@ class MultiLayerNPTContextTransfer:
         context_response = self.generate_response(context_prompt)
         context_probs = self.get_token_probabilities(context_prompt, target_tokens)
         
-        # Store context v_a, v_b for all layers
+        # Store context modulations for all layers
         context_modulations = {}
         for layer_idx in self.layer_indices:
-            if layer_idx in self.captured_v_a:
-                context_modulations[layer_idx] = (
-                    self.captured_v_a[layer_idx].clone(),
-                    self.captured_v_b[layer_idx].clone()
-                )
+            if layer_idx in self.captured_v_a_gate:
+                if self.captured_v_a_up.get(layer_idx) is not None:
+                    # Dual modulation
+                    context_modulations[layer_idx] = {
+                        'gate': (self.captured_v_a_gate[layer_idx].clone(),
+                                self.captured_v_b_gate[layer_idx].clone()),
+                        'up': (self.captured_v_a_up[layer_idx].clone(),
+                              self.captured_v_b_up[layer_idx].clone())
+                    }
+                else:
+                    # Single modulation
+                    context_modulations[layer_idx] = (
+                        self.captured_v_a_gate[layer_idx].clone(),
+                        self.captured_v_b_gate[layer_idx].clone()
+                    )
         
         print(f"Response: {Fore.GREEN}{context_response}{Style.RESET_ALL}")
         print(f"Token Probabilities:")
@@ -316,15 +433,36 @@ class MultiLayerNPTContextTransfer:
         
         print(f"\nCaptured modulations from layers:")
         for layer_idx in sorted(context_modulations.keys()):
-            v_a, v_b = context_modulations[layer_idx]
-            # Handle both rank-1 and rank-k
-            if v_a.dim() == 4:  # rank-k
-                v_a_norm = v_a.norm(dim=(-2, -1)).mean().item()
-                v_b_norm = v_b.norm(dim=(-2, -1)).mean().item()
-                num_ranks = v_a.shape[2]
-                print(f"  Layer {layer_idx}: v_a norm={v_a_norm:.4f}, v_b norm={v_b_norm:.4f} (rank-{num_ranks})")
-            else:  # rank-1
-                print(f"  Layer {layer_idx}: v_a norm={v_a.norm():.4f}, v_b norm={v_b.norm():.4f}")
+            modulation = context_modulations[layer_idx]
+            if isinstance(modulation, dict):
+                # Dual modulation
+                v_a_gate, v_b_gate = modulation['gate']
+                v_a_up, v_b_up = modulation['up']
+
+                # Handle rank-k vs rank-1
+                if v_a_gate.dim() == 4:  # rank-k
+                    v_a_gate_norm = v_a_gate.norm(dim=(-2, -1)).mean().item()
+                    v_b_gate_norm = v_b_gate.norm(dim=(-2, -1)).mean().item()
+                    v_a_up_norm = v_a_up.norm(dim=(-2, -1)).mean().item()
+                    v_b_up_norm = v_b_up.norm(dim=(-2, -1)).mean().item()
+                    num_ranks = v_a_gate.shape[2]
+                    print(f"  Layer {layer_idx} (dual, rank-{num_ranks}):")
+                    print(f"    Gate: v_a={v_a_gate_norm:.4f}, v_b={v_b_gate_norm:.4f}")
+                    print(f"    Up:   v_a={v_a_up_norm:.4f}, v_b={v_b_up_norm:.4f}")
+                else:  # rank-1
+                    print(f"  Layer {layer_idx} (dual):")
+                    print(f"    Gate: v_a={v_a_gate.norm():.4f}, v_b={v_b_gate.norm():.4f}")
+                    print(f"    Up:   v_a={v_a_up.norm():.4f}, v_b={v_b_up.norm():.4f}")
+            else:
+                # Single modulation
+                v_a, v_b = modulation
+                if v_a.dim() == 4:  # rank-k
+                    v_a_norm = v_a.norm(dim=(-2, -1)).mean().item()
+                    v_b_norm = v_b.norm(dim=(-2, -1)).mean().item()
+                    num_ranks = v_a.shape[2]
+                    print(f"  Layer {layer_idx} (single, rank-{num_ranks}): v_a={v_a_norm:.4f}, v_b={v_b_norm:.4f}")
+                else:  # rank-1
+                    print(f"  Layer {layer_idx} (single): v_a={v_a.norm():.4f}, v_b={v_b.norm():.4f}")
         
         # ========== Run 3: Multi-Layer Context Transfer ==========
         print(f"\n{Fore.YELLOW}Run 3: Multi-Layer Context Transfer{Style.RESET_ALL}")
@@ -348,11 +486,21 @@ class MultiLayerNPTContextTransfer:
             
             # Show what happened at each layer
             print(f"\nModulation verification (last token position):")
-            for layer_idx in sorted(self.captured_v_a.keys()):
+            for layer_idx in sorted(self.captured_v_a_gate.keys()):
                 if layer_idx in baseline_modulations and layer_idx in context_modulations:
-                    baseline_v_a, _ = baseline_modulations[layer_idx]
-                    context_v_a, _ = context_modulations[layer_idx]
-                    transfer_v_a = self.captured_v_a[layer_idx]
+                    # Extract modulations based on type
+                    if isinstance(baseline_modulations[layer_idx], dict):
+                        # Dual modulation
+                        baseline_v_a, _ = baseline_modulations[layer_idx]['gate']
+                        context_v_a, _ = context_modulations[layer_idx]['gate']
+                        mod_type = "gate"
+                    else:
+                        # Single modulation
+                        baseline_v_a, _ = baseline_modulations[layer_idx]
+                        context_v_a, _ = context_modulations[layer_idx]
+                        mod_type = "single"
+
+                    transfer_v_a = self.captured_v_a_gate[layer_idx]
 
                     # Handle both rank-1 and rank-k
                     if baseline_v_a.dim() == 4:  # rank-k
@@ -370,7 +518,7 @@ class MultiLayerNPTContextTransfer:
 
                     status = f"{Fore.GREEN}✓{Style.RESET_ALL}" if match else f"{Fore.RED}✗{Style.RESET_ALL}"
 
-                    print(f"  Layer {layer_idx}: baseline={baseline_norm:.4f}, "
+                    print(f"  Layer {layer_idx} ({mod_type}): baseline={baseline_norm:.4f}, "
                           f"context={context_norm:.4f}, transfer={transfer_norm:.4f} {status}")
             
             # ========== Analysis ==========
@@ -406,8 +554,17 @@ class MultiLayerNPTContextTransfer:
             print(f"\nLayer-wise Modulation Analysis:")
             for layer_idx in sorted(baseline_modulations.keys()):
                 if layer_idx in context_modulations:
-                    baseline_v_a, baseline_v_b = baseline_modulations[layer_idx]
-                    context_v_a, context_v_b = context_modulations[layer_idx]
+                    # Extract modulations based on type
+                    if isinstance(baseline_modulations[layer_idx], dict):
+                        # Dual modulation
+                        baseline_v_a, baseline_v_b = baseline_modulations[layer_idx]['gate']
+                        context_v_a, context_v_b = context_modulations[layer_idx]['gate']
+                        mod_type = "(dual-gate)"
+                    else:
+                        # Single modulation
+                        baseline_v_a, baseline_v_b = baseline_modulations[layer_idx]
+                        context_v_a, context_v_b = context_modulations[layer_idx]
+                        mod_type = "(single)"
 
                     # Handle both rank-1 and rank-k
                     if baseline_v_a.dim() == 4:  # rank-k
@@ -433,7 +590,7 @@ class MultiLayerNPTContextTransfer:
                         cos_sim_a = sum(cos_sims) / len(cos_sims)
 
                         num_ranks = baseline_v_a.shape[2]
-                        print(f"  Layer {layer_idx} (rank-{num_ranks}):")
+                        print(f"  Layer {layer_idx} {mod_type} (rank-{num_ranks}):")
                     else:  # rank-1
                         # Focus on last token
                         v_a_diff = (context_v_a[0, -1, :] - baseline_v_a[0, -1, :]).norm()
@@ -444,7 +601,7 @@ class MultiLayerNPTContextTransfer:
                             context_v_a[0, -1, :].unsqueeze(0)
                         ).item()
 
-                        print(f"  Layer {layer_idx}:")
+                        print(f"  Layer {layer_idx} {mod_type}:")
 
                     print(f"    v_a difference: {v_a_diff:.4f}, cosine sim: {cos_sim_a:.4f}")
                     print(f"    v_b difference: {v_b_diff:.4f}")
@@ -533,16 +690,46 @@ def main():
     # Load weights and detect layers
     npt_weights = torch.load(weights_path, map_location='cpu')
     
-    # Detect which layers have NPT weights
+    # Detect which layers have NPT weights, their ranks, num_ranks, and dual modulation
     available_layers = set()
-    layer_ranks = {}
+    layer_info = {}  # layer_idx -> (rank, num_ranks, has_dual_modulation)
+
+    # First detect basic layer info and num_ranks
     for key in npt_weights.keys():
         if "layer_" in key and "_np." in key and "W_down" in key:
             layer_idx = int(key.split("_")[1])
             available_layers.add(layer_idx)
-            layer_ranks[layer_idx] = npt_weights[key].shape[1]
+
+            # Check if it's a multi-rank weight (has .0, .1, etc.)
+            if key.endswith('.0') or key.endswith('.1') or key.endswith('.2') or key.endswith('.3'):
+                # Count how many rank components there are
+                num_ranks = 0
+                for i in range(10):  # Check up to 10 ranks
+                    test_key = key.rsplit('.', 1)[0] + f'.{i}'
+                    if test_key in npt_weights:
+                        num_ranks += 1
+                    else:
+                        break
+                rank = npt_weights[key].shape[1]
+                layer_info[layer_idx] = [rank, num_ranks, False]  # Will check dual later
+            else:
+                # Single rank
+                rank = npt_weights[key].shape[1]
+                layer_info[layer_idx] = [rank, 1, False]  # Will check dual later
+
+    # Check for dual modulation
+    for key in npt_weights.keys():
+        if ("W_down_gate" in key or "W_down_up" in key) and "layer_" in key:
+            layer_idx = int(key.split("_")[1])
+            if layer_idx in layer_info:
+                layer_info[layer_idx][2] = True  # Has dual modulation
     
     print(f"  Available NPT layers: {sorted(available_layers)}")
+    for layer_idx in sorted(available_layers):
+        if layer_idx in layer_info:
+            rank, num_ranks, has_dual = layer_info[layer_idx]
+            dual_str = " (dual modulation)" if has_dual else ""
+            print(f"    Layer {layer_idx}: rank={rank}, num_ranks={num_ranks}{dual_str}")
     
     # Check if requested layers are available
     for idx in layer_indices:
@@ -558,12 +745,17 @@ def main():
     
     print(f"  Using layers: {layer_indices}")
     
-    # Convert layers to NPT
+    # Convert layers to NPT using detected parameters
     for layer_idx in layer_indices:
-        detected_rank = layer_ranks.get(layer_idx, 256)
+        # Get detected parameters or use defaults
+        rank, num_ranks, has_dual = layer_info.get(layer_idx, (256, 1, False))
+        print(f"  Layer {layer_idx}: rank={rank}, num_ranks={num_ranks}, dual_modulation={has_dual}")
+
         npt_config = NPTConfig(
             layers_to_convert=[layer_idx],
-            np_rank=detected_rank,
+            np_rank=rank,
+            num_ranks=num_ranks,
+            dual_modulation=has_dual,
             np_init_scale=0.001,
             single_layer_mode=False
         )

@@ -274,8 +274,20 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                 )
                 attention_output = attn_outputs[0]
 
-                # Get v_a, v_b from attention
-                v_a, v_b = layer.np_component(attention_output)
+                # Get modulation from attention
+                modulation_output = layer.np_component(attention_output)
+
+                # Check if dual modulation
+                if isinstance(modulation_output[0], tuple):
+                    # Dual modulation
+                    (v_a_gate, v_b_gate), (v_a_up, v_b_up) = modulation_output
+                    v_a = v_a_gate  # For compatibility with loss computation
+                    v_b = v_b_gate
+                else:
+                    # Single modulation
+                    v_a, v_b = modulation_output
+                    v_a_gate = v_b_gate = None
+                    v_a_up = v_b_up = None
 
                 # NEW ARCHITECTURE: MLP takes only residual h, not h+attention
                 # The residual before adding attention
@@ -285,7 +297,16 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
 
                 # MLP gets normalized residual WITHOUT attention
                 mlp_input = layer.post_attention_layernorm(mlp_residual)
-                mlp_modulated = layer._apply_modulated_mlp(mlp_input, v_a, v_b)
+
+                # Apply appropriate modulation
+                if v_a_gate is not None:
+                    # Dual modulation
+                    mlp_modulated = layer._apply_dual_modulated_mlp(
+                        mlp_input, v_a_gate, v_b_gate, v_a_up, v_b_up
+                    )
+                else:
+                    # Single modulation
+                    mlp_modulated = layer._apply_modulated_mlp(mlp_input, v_a, v_b)
 
                 # Store outputs for loss computation
                 layer_outputs[i] = {
@@ -295,7 +316,12 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                     'teacher_mlp_with_attention': teacher_states[f"mlp_with_attention_{i}"],
                     'v_a': v_a,
                     'v_b': v_b,
-                    'hidden_states': mlp_input
+                    'hidden_states': mlp_input,
+                    # Store dual modulation components if available
+                    'v_a_gate': v_a_gate,
+                    'v_b_gate': v_b_gate,
+                    'v_a_up': v_a_up,
+                    'v_b_up': v_b_up
                 }
 
                 # Delete teacher states for this layer after use to free memory
@@ -348,9 +374,20 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
             # Regularization on v_a and v_b
             v_a = outputs['v_a']
             v_b = outputs['v_b']
-            v_a_reg = v_a.pow(2).mean()
-            v_b_reg = v_b.pow(2).mean()
-            reg_loss = v_a_reg + v_b_reg
+
+            # Handle dual modulation regularization
+            if outputs['v_a_gate'] is not None:
+                # Dual modulation: regularize all components
+                v_a_gate_reg = outputs['v_a_gate'].pow(2).mean()
+                v_b_gate_reg = outputs['v_b_gate'].pow(2).mean()
+                v_a_up_reg = outputs['v_a_up'].pow(2).mean()
+                v_b_up_reg = outputs['v_b_up'].pow(2).mean()
+                reg_loss = v_a_gate_reg + v_b_gate_reg + v_a_up_reg + v_b_up_reg
+            else:
+                # Single modulation
+                v_a_reg = v_a.pow(2).mean()
+                v_b_reg = v_b.pow(2).mean()
+                reg_loss = v_a_reg + v_b_reg
 
             # Combine with weights from config
             layer_loss = (
@@ -897,6 +934,12 @@ def parse_args():
         default="improved",
         help="Initialization strategy"
     )
+    parser.add_argument(
+        "--dual_modulation",
+        action="store_true",
+        default=True,
+        help="Use dual modulation for gate and up projections"
+    )
 
     # Loss weights
     parser.add_argument(
@@ -1174,7 +1217,8 @@ def setup_multi_layer_model(args, layers_to_train):
         np_init_scale=args.np_init_scale,
         single_layer_mode=False,  # Multi-layer mode
         num_ranks=args.num_ranks,
-        init_strategy=args.init_strategy
+        init_strategy=args.init_strategy,
+        dual_modulation=args.dual_modulation
     )
 
     # Convert layers

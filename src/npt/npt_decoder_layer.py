@@ -57,7 +57,8 @@ class NPTDecoderLayer(LlamaDecoderLayer):
             init_scale=getattr(config, 'np_init_scale', 0.01),
             single_layer_mode=getattr(config, 'single_layer_mode', False),
             num_ranks=getattr(config, 'num_ranks', 1),  # Support rank-k updates
-            init_strategy=getattr(config, 'init_strategy', 'improved')  # Better initialization
+            init_strategy=getattr(config, 'init_strategy', 'improved'),  # Better initialization
+            dual_modulation=getattr(config, 'dual_modulation', True)  # Dual gate/up modulation
         )
 
         # Flag to toggle between NPT and standard mode
@@ -169,14 +170,21 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         hidden_states = residual + attn_output
 
         # Generate modulation from attention output
-        v_a, v_b = self.np_component(attn_output)
+        modulation_output = self.np_component(attn_output)
 
         # CRITICAL: MLP takes only original residual, not h + attention
         # This is the key difference - MLP modulation must make MLP(h) behave like MLP(h + attn)
         mlp_input = self.post_attention_layernorm(residual)
 
         # Apply modulated MLP
-        mlp_output = self._apply_modulated_mlp(mlp_input, v_a, v_b)
+        if isinstance(modulation_output[0], tuple):
+            # Dual modulation: separate for gate and up
+            (v_a_gate, v_b_gate), (v_a_up, v_b_up) = modulation_output
+            mlp_output = self._apply_dual_modulated_mlp(mlp_input, v_a_gate, v_b_gate, v_a_up, v_b_up)
+        else:
+            # Single modulation (backward compatibility)
+            v_a, v_b = modulation_output
+            mlp_output = self._apply_modulated_mlp(mlp_input, v_a, v_b)
 
         # Add MLP output to the hidden states (which already contains h + attention)
         # Final output: h + attention + modulated_mlp(h)
@@ -197,6 +205,71 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         
         return outputs
     
+    def _apply_dual_modulated_mlp(
+        self,
+        hidden_states: torch.Tensor,
+        v_a_gate: torch.Tensor,
+        v_b_gate: torch.Tensor,
+        v_a_up: torch.Tensor,
+        v_b_up: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Apply MLP with dual weight modulation (gate and up projections).
+
+        This implementation modulates both gate and up projection weights,
+        providing more expressiveness and direct alignment with permanent weight updates.
+
+        Args:
+            hidden_states: Input to MLP (batch_size, seq_len, hidden_size)
+            v_a_gate, v_b_gate: Modulation for gate projection
+            v_a_up, v_b_up: Modulation for up projection
+
+        Returns:
+            MLP output (batch_size, seq_len, hidden_size)
+        """
+        # Get base weights
+        W_gate_base = self.mlp.gate_proj.weight  # (intermediate_size, hidden_size)
+        W_up_base = self.mlp.up_proj.weight  # (intermediate_size, hidden_size)
+        W_down = self.mlp.down_proj.weight  # (hidden_size, intermediate_size)
+
+        # Standard projections
+        gate_base = F.linear(hidden_states, W_gate_base)  # (batch, seq, intermediate)
+        up_base = F.linear(hidden_states, W_up_base)  # (batch, seq, intermediate)
+
+        # Compute gate modulation
+        if v_a_gate.dim() == 3:
+            # Rank-1 modulation
+            v_a_dot_h_gate = torch.sum(v_a_gate * hidden_states, dim=-1, keepdim=True)
+            gate_modulation = v_b_gate * v_a_dot_h_gate
+        else:
+            # Rank-k modulation
+            h_expanded = hidden_states.unsqueeze(2)
+            v_a_dot_h_gate = torch.sum(v_a_gate * h_expanded, dim=-1, keepdim=True)
+            gate_modulations = v_b_gate * v_a_dot_h_gate
+            gate_modulation = torch.sum(gate_modulations, dim=2)
+
+        # Compute up modulation
+        if v_a_up.dim() == 3:
+            # Rank-1 modulation
+            v_a_dot_h_up = torch.sum(v_a_up * hidden_states, dim=-1, keepdim=True)
+            up_modulation = v_b_up * v_a_dot_h_up
+        else:
+            # Rank-k modulation
+            h_expanded = hidden_states.unsqueeze(2)
+            v_a_dot_h_up = torch.sum(v_a_up * h_expanded, dim=-1, keepdim=True)
+            up_modulations = v_b_up * v_a_dot_h_up
+            up_modulation = torch.sum(up_modulations, dim=2)
+
+        # Apply modulations to both projections
+        gate_modulated = gate_base + gate_modulation
+        up_modulated = up_base + up_modulation
+
+        # SwiGLU computation with modulated weights
+        intermediate = F.silu(gate_modulated) * up_modulated
+        output = F.linear(intermediate, W_down)
+
+        return output
+
     def _apply_modulated_mlp(
         self,
         hidden_states: torch.Tensor,

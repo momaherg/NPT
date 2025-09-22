@@ -42,20 +42,23 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, int]]:
+def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, int, bool]]:
     """
-    Detect which layers have NPT weights, their ranks, and num_ranks.
+    Detect which layers have NPT weights, their ranks, num_ranks, and dual modulation.
 
     Args:
         weights_dict: Dictionary of NPT weights
 
     Returns:
-        Dictionary mapping layer index to tuple of (rank, num_ranks)
+        Dictionary mapping layer index to tuple of (rank, num_ranks, has_dual_modulation)
     """
     layer_info = {}
 
     # Track W_down keys per layer to detect num_ranks
     layer_w_downs = {}
+
+    # Track dual modulation
+    has_dual_modulation = {}
 
     for key in weights_dict.keys():
         # Parse keys for W_down weights
@@ -90,6 +93,21 @@ def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, i
                 else:
                     layer_w_downs[layer_idx][None] = weights_dict[key]
 
+    # Also check for dual modulation weights
+    for key in weights_dict.keys():
+        if "W_down_gate" in key or "W_a_up_gate" in key or "W_down_up" in key:
+            # Extract layer index
+            layer_idx = None
+            if key.startswith("layer_") and "_np." in key:
+                parts = key.split(".")
+                layer_idx = int(parts[0].split("_")[1])
+            elif "model.layers." in key and ".np_component." in key:
+                parts = key.split(".")
+                layer_idx = int(parts[2])
+
+            if layer_idx is not None:
+                has_dual_modulation[layer_idx] = True
+
     # Process collected weights to determine rank and num_ranks
     for layer_idx, components in layer_w_downs.items():
         if None in components:
@@ -103,7 +121,7 @@ def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, i
             first_weight = list(components.values())[0]
             rank = first_weight.shape[1]
 
-        layer_info[layer_idx] = (rank, num_ranks)
+        layer_info[layer_idx] = (rank, num_ranks, has_dual_modulation.get(layer_idx, False))
 
     return layer_info
 
@@ -237,11 +255,18 @@ class KnowledgeInjector:
         v_b_collected = None
         attention_output = None
         
-        # Hook to capture v_a and v_b
+        # Hook to capture v_a and v_b (handles dual modulation)
         def hook_fn(module, input, output):
             nonlocal v_a_collected, v_b_collected
             if isinstance(output, tuple) and len(output) == 2:
-                v_a_collected, v_b_collected = output
+                # Check if dual modulation (nested tuple structure)
+                if isinstance(output[0], tuple) and isinstance(output[1], tuple):
+                    # Dual modulation: ((v_a_gate, v_b_gate), (v_a_up, v_b_up))
+                    v_a_collected = output  # Store entire dual structure
+                    v_b_collected = None  # Flag for dual modulation
+                else:
+                    # Single modulation: (v_a, v_b)
+                    v_a_collected, v_b_collected = output
         
         # Register hook
         handle = npt_layer.np_component.register_forward_hook(hook_fn)
@@ -291,11 +316,22 @@ class KnowledgeInjector:
         finally:
             handle.remove()
         
-        if v_a_collected is None or v_b_collected is None:
-            raise RuntimeError("Failed to collect v_a and v_b from NPT layer")
+        # Check if we got dual modulation
+        is_dual_modulation = v_b_collected is None
 
-        # Check if rank-k (4D) or rank-1 (3D)
-        is_rank_k = v_a_collected.dim() == 4
+        if is_dual_modulation:
+            # Dual modulation: v_a_collected contains ((v_a_gate, v_b_gate), (v_a_up, v_b_up))
+            (v_a_gate_full, v_b_gate_full), (v_a_up_full, v_b_up_full) = v_a_collected
+
+            # Check if rank-k (4D) or rank-1 (3D) - check gate component
+            is_rank_k = v_a_gate_full.dim() == 4
+        else:
+            # Single modulation
+            if v_a_collected is None or v_b_collected is None:
+                raise RuntimeError("Failed to collect v_a and v_b from NPT layer")
+
+            # Check if rank-k (4D) or rank-1 (3D)
+            is_rank_k = v_a_collected.dim() == 4
 
         # Select position based on target_position
         if target_position == "last":
@@ -308,65 +344,151 @@ class KnowledgeInjector:
             else:
                 last_pos = seq_len - 1
 
-            if is_rank_k:
-                # v_a_collected: (batch, seq, num_ranks, d_model)
-                v_a = v_a_collected[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_model)
-                v_b = v_b_collected[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_ffn)
+            if is_dual_modulation:
+                # Process dual modulation
+                if is_rank_k:
+                    v_a_gate = v_a_gate_full[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_model)
+                    v_b_gate = v_b_gate_full[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_ffn)
+                    v_a_up = v_a_up_full[:, last_pos, :, :].squeeze(0)
+                    v_b_up = v_b_up_full[:, last_pos, :, :].squeeze(0)
+                else:
+                    v_a_gate = v_a_gate_full[:, last_pos, :].squeeze(0)  # (d_model,)
+                    v_b_gate = v_b_gate_full[:, last_pos, :].squeeze(0)  # (d_ffn,)
+                    v_a_up = v_a_up_full[:, last_pos, :].squeeze(0)
+                    v_b_up = v_b_up_full[:, last_pos, :].squeeze(0)
             else:
-                # v_a_collected: (batch, seq, d_model)
-                v_a = v_a_collected[:, last_pos, :].squeeze(0)  # (d_model,)
-                v_b = v_b_collected[:, last_pos, :].squeeze(0)  # (d_ffn,)
+                if is_rank_k:
+                    v_a = v_a_collected[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_model)
+                    v_b = v_b_collected[:, last_pos, :, :].squeeze(0)  # (num_ranks, d_ffn)
+                else:
+                    v_a = v_a_collected[:, last_pos, :].squeeze(0)  # (d_model,)
+                    v_b = v_b_collected[:, last_pos, :].squeeze(0)  # (d_ffn,)
         elif target_position == "first":
-            if is_rank_k:
-                v_a = v_a_collected[:, 0, :, :].squeeze(0)  # (num_ranks, d_model)
-                v_b = v_b_collected[:, 0, :, :].squeeze(0)  # (num_ranks, d_ffn)
+            if is_dual_modulation:
+                if is_rank_k:
+                    v_a_gate = v_a_gate_full[:, 0, :, :].squeeze(0)
+                    v_b_gate = v_b_gate_full[:, 0, :, :].squeeze(0)
+                    v_a_up = v_a_up_full[:, 0, :, :].squeeze(0)
+                    v_b_up = v_b_up_full[:, 0, :, :].squeeze(0)
+                else:
+                    v_a_gate = v_a_gate_full[:, 0, :].squeeze(0)
+                    v_b_gate = v_b_gate_full[:, 0, :].squeeze(0)
+                    v_a_up = v_a_up_full[:, 0, :].squeeze(0)
+                    v_b_up = v_b_up_full[:, 0, :].squeeze(0)
             else:
-                v_a = v_a_collected[:, 0, :].squeeze(0)  # (d_model,)
-                v_b = v_b_collected[:, 0, :].squeeze(0)  # (d_ffn,)
+                if is_rank_k:
+                    v_a = v_a_collected[:, 0, :, :].squeeze(0)
+                    v_b = v_b_collected[:, 0, :, :].squeeze(0)
+                else:
+                    v_a = v_a_collected[:, 0, :].squeeze(0)
+                    v_b = v_b_collected[:, 0, :].squeeze(0)
         elif target_position == "all":
             # Average across all positions
-            if is_rank_k:
-                v_a = v_a_collected.mean(dim=1).squeeze(0)  # (num_ranks, d_model)
-                v_b = v_b_collected.mean(dim=1).squeeze(0)  # (num_ranks, d_ffn)
+            if is_dual_modulation:
+                if is_rank_k:
+                    v_a_gate = v_a_gate_full.mean(dim=1).squeeze(0)
+                    v_b_gate = v_b_gate_full.mean(dim=1).squeeze(0)
+                    v_a_up = v_a_up_full.mean(dim=1).squeeze(0)
+                    v_b_up = v_b_up_full.mean(dim=1).squeeze(0)
+                else:
+                    v_a_gate = v_a_gate_full.mean(dim=1).squeeze(0)
+                    v_b_gate = v_b_gate_full.mean(dim=1).squeeze(0)
+                    v_a_up = v_a_up_full.mean(dim=1).squeeze(0)
+                    v_b_up = v_b_up_full.mean(dim=1).squeeze(0)
             else:
-                v_a = v_a_collected.mean(dim=1).squeeze(0)  # (d_model,)
-                v_b = v_b_collected.mean(dim=1).squeeze(0)  # (d_ffn,)
+                if is_rank_k:
+                    v_a = v_a_collected.mean(dim=1).squeeze(0)
+                    v_b = v_b_collected.mean(dim=1).squeeze(0)
+                else:
+                    v_a = v_a_collected.mean(dim=1).squeeze(0)
+                    v_b = v_b_collected.mean(dim=1).squeeze(0)
         else:
             raise ValueError(f"Unknown target_position: {target_position}")
         
-        # Compute some metadata
-        if is_rank_k:
-            # For rank-k, compute norms and provide num_ranks info
-            num_ranks = v_a.shape[0]
-            # Compute norm of the sum of rank-1 components
-            total_v_a_norm = v_a.norm(dim=-1).sum().item()  # Sum of norms across ranks
-            total_v_b_norm = v_b.norm(dim=-1).sum().item()
-            metadata = {
-                "text": text,
-                "position": target_position,
-                "v_a_norm": total_v_a_norm,
-                "v_b_norm": total_v_b_norm,
-                "delta_w_rank_norm": total_v_a_norm * total_v_b_norm,  # Approximate
-                "num_ranks": num_ranks,
-                "is_rank_k": True,
-                "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
-                "layer_idx": self.active_layer_idx
+        # Compute metadata and return appropriate structure
+        if is_dual_modulation:
+            # Dual modulation case
+            if is_rank_k:
+                num_ranks = v_a_gate.shape[0]
+                # Compute norms for both gate and up projections
+                total_v_a_gate_norm = v_a_gate.norm(dim=-1).sum().item()
+                total_v_b_gate_norm = v_b_gate.norm(dim=-1).sum().item()
+                total_v_a_up_norm = v_a_up.norm(dim=-1).sum().item()
+                total_v_b_up_norm = v_b_up.norm(dim=-1).sum().item()
+
+                metadata = {
+                    "text": text,
+                    "position": target_position,
+                    "v_a_gate_norm": total_v_a_gate_norm,
+                    "v_b_gate_norm": total_v_b_gate_norm,
+                    "v_a_up_norm": total_v_a_up_norm,
+                    "v_b_up_norm": total_v_b_up_norm,
+                    "num_ranks": num_ranks,
+                    "is_rank_k": True,
+                    "is_dual_modulation": True,
+                    "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+                    "layer_idx": self.active_layer_idx
+                }
+            else:
+                metadata = {
+                    "text": text,
+                    "position": target_position,
+                    "v_a_gate_norm": v_a_gate.norm().item(),
+                    "v_b_gate_norm": v_b_gate.norm().item(),
+                    "v_a_up_norm": v_a_up.norm().item(),
+                    "v_b_up_norm": v_b_up.norm().item(),
+                    "num_ranks": 1,
+                    "is_rank_k": False,
+                    "is_dual_modulation": True,
+                    "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+                    "layer_idx": self.active_layer_idx
+                }
+
+            # Return dual modulation structure
+            return {
+                'type': 'dual',
+                'gate': (v_a_gate, v_b_gate),
+                'up': (v_a_up, v_b_up),
+                'metadata': metadata
             }
         else:
-            # Rank-1 metadata
-            metadata = {
-                "text": text,
-                "position": target_position,
-                "v_a_norm": v_a.norm().item(),
-                "v_b_norm": v_b.norm().item(),
-                "delta_w_rank1_norm": (v_b.norm() * v_a.norm()).item(),
-                "num_ranks": 1,
-                "is_rank_k": False,
-                "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
-                "layer_idx": self.active_layer_idx
+            # Single modulation case (backward compatibility)
+            if is_rank_k:
+                num_ranks = v_a.shape[0]
+                total_v_a_norm = v_a.norm(dim=-1).sum().item()
+                total_v_b_norm = v_b.norm(dim=-1).sum().item()
+                metadata = {
+                    "text": text,
+                    "position": target_position,
+                    "v_a_norm": total_v_a_norm,
+                    "v_b_norm": total_v_b_norm,
+                    "delta_w_rank_norm": total_v_a_norm * total_v_b_norm,
+                    "num_ranks": num_ranks,
+                    "is_rank_k": True,
+                    "is_dual_modulation": False,
+                    "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+                    "layer_idx": self.active_layer_idx
+                }
+            else:
+                metadata = {
+                    "text": text,
+                    "position": target_position,
+                    "v_a_norm": v_a.norm().item(),
+                    "v_b_norm": v_b.norm().item(),
+                    "delta_w_rank1_norm": (v_b.norm() * v_a.norm()).item(),
+                    "num_ranks": 1,
+                    "is_rank_k": False,
+                    "is_dual_modulation": False,
+                    "tokens": self.tokenizer.convert_ids_to_tokens(input_ids[0].tolist()),
+                    "layer_idx": self.active_layer_idx
+                }
+
+            # Return single modulation structure (backward compatible but in dict form)
+            return {
+                'type': 'single',
+                'modulation': (v_a, v_b),
+                'metadata': metadata
             }
-        
-        return v_a, v_b, metadata
     
     def inject_knowledge(
         self,
@@ -391,58 +513,131 @@ class KnowledgeInjector:
             alpha = self.injection_strength
         
         print(f"\n{Fore.YELLOW}Extracting knowledge representation...{Style.RESET_ALL}")
-        
-        # Extract v_a and v_b for this fact
-        v_a, v_b, metadata = self.extract_delta_weights(fact_text, position)
-        
+
+        # Extract modulation weights for this fact
+        result = self.extract_delta_weights(fact_text, position)
+        metadata = result['metadata']
+
         # Get the NPT layer
         npt_layer = self.model.npt_layers[self.active_layer_idx]
-        
-        # Apply the rank-k or rank-1 update to the MLP weights
-        with torch.no_grad():
-            # Get current MLP input weights
-            W_in = npt_layer.mlp.gate_proj.weight  # Shape: [intermediate_size, hidden_size]
 
-            # Check if rank-k or rank-1
-            if metadata.get('is_rank_k', False) and v_a.dim() == 2:
+        # Helper function to compute rank update
+        def compute_rank_update(v_b, v_a, is_rank_k):
+            if is_rank_k and v_a.dim() == 2:
                 # Rank-k update: sum of k rank-1 updates
-                # v_a shape: [num_ranks, hidden_size]
-                # v_b shape: [num_ranks, intermediate_size]
-                delta_W = torch.zeros_like(W_in)
+                delta_W = torch.zeros(v_b.shape[-1], v_a.shape[-1], device=v_a.device, dtype=v_a.dtype)
                 num_ranks = v_a.shape[0]
                 for i in range(num_ranks):
-                    # Each rank-1 component
                     delta_W += alpha * torch.outer(v_b[i], v_a[i])
+                return delta_W
             else:
-                # Rank-1 update: ΔW = α * outer(v_b, v_a)
-                # v_b shape: [intermediate_size], v_a shape: [hidden_size]
-                delta_W = alpha * torch.outer(v_b, v_a)
-            
-            # Store original weights per layer if first injection and not accumulating
-            if self.active_layer_idx not in self.original_weights or not accumulate:
-                self.original_weights[self.active_layer_idx] = W_in.data.clone()
-            
-            # Apply update
-            if not accumulate:
-                # Reset to original first
-                W_in.data = self.original_weights[self.active_layer_idx].clone()
-            
-            W_in.data += delta_W
+                # Rank-1 update
+                return alpha * torch.outer(v_b, v_a)
+
+        # Apply the update to the MLP weights
+        with torch.no_grad():
+            if result['type'] == 'dual':
+                # Dual modulation - update both gate and up projections
+                v_a_gate, v_b_gate = result['gate']
+                v_a_up, v_b_up = result['up']
+
+                # Get current weights
+                W_gate = npt_layer.mlp.gate_proj.weight
+                W_up = npt_layer.mlp.up_proj.weight
+
+                # Store original weights if first injection and not accumulating
+                if self.active_layer_idx not in self.original_weights or not accumulate:
+                    self.original_weights[self.active_layer_idx] = {
+                        'gate': W_gate.data.clone(),
+                        'up': W_up.data.clone()
+                    }
+
+                # Apply updates to gate projection
+                if not accumulate:
+                    # Reset to original first
+                    if isinstance(self.original_weights[self.active_layer_idx], dict):
+                        W_gate.data = self.original_weights[self.active_layer_idx]['gate'].clone()
+                    else:
+                        # Backward compatibility - single weight stored
+                        W_gate.data = self.original_weights[self.active_layer_idx].clone()
+
+                delta_W_gate = compute_rank_update(v_b_gate, v_a_gate, metadata.get('is_rank_k', False))
+                W_gate.data += delta_W_gate
+
+                # Apply updates to up projection
+                if not accumulate:
+                    if isinstance(self.original_weights[self.active_layer_idx], dict) and 'up' in self.original_weights[self.active_layer_idx]:
+                        W_up.data = self.original_weights[self.active_layer_idx]['up'].clone()
+
+                delta_W_up = compute_rank_update(v_b_up, v_a_up, metadata.get('is_rank_k', False))
+                W_up.data += delta_W_up
+
+                # Store delta_W for metrics (use gate as primary)
+                delta_W = delta_W_gate
+
+            else:
+                # Single modulation (backward compatibility)
+                v_a, v_b = result['modulation']
+
+                # Get current MLP gate weights
+                W_in = npt_layer.mlp.gate_proj.weight
+
+                # Store original weights per layer if first injection and not accumulating
+                if self.active_layer_idx not in self.original_weights or not accumulate:
+                    self.original_weights[self.active_layer_idx] = W_in.data.clone()
+
+                # Apply update
+                if not accumulate:
+                    # Reset to original first
+                    if isinstance(self.original_weights[self.active_layer_idx], torch.Tensor):
+                        W_in.data = self.original_weights[self.active_layer_idx].clone()
+                    elif isinstance(self.original_weights[self.active_layer_idx], dict) and 'gate' in self.original_weights[self.active_layer_idx]:
+                        W_in.data = self.original_weights[self.active_layer_idx]['gate'].clone()
+
+                delta_W = compute_rank_update(v_b, v_a, metadata.get('is_rank_k', False))
+                W_in.data += delta_W
             
             # Track injected fact for this layer
-            injection_info = {
-                "fact": fact_text,
-                "timestamp": datetime.now().isoformat(),
-                "alpha": alpha,
-                "position": position,
-                "v_a_norm": metadata["v_a_norm"],
-                "v_b_norm": metadata["v_b_norm"],
-                "delta_norm": delta_W.norm().item(),
-                "weight_change_ratio": (delta_W.norm() / W_in.norm()).item(),
-                "layer_idx": self.active_layer_idx,
-                "num_ranks": metadata.get("num_ranks", 1),
-                "is_rank_k": metadata.get("is_rank_k", False)
-            }
+            if result['type'] == 'dual':
+                # Dual modulation metrics
+                injection_info = {
+                    "fact": fact_text,
+                    "timestamp": datetime.now().isoformat(),
+                    "alpha": alpha,
+                    "position": position,
+                    "modulation_type": "dual",
+                    "projections_modified": ["gate", "up"],
+                    "v_a_gate_norm": metadata.get("v_a_gate_norm", 0),
+                    "v_b_gate_norm": metadata.get("v_b_gate_norm", 0),
+                    "v_a_up_norm": metadata.get("v_a_up_norm", 0),
+                    "v_b_up_norm": metadata.get("v_b_up_norm", 0),
+                    "gate_delta_norm": delta_W_gate.norm().item(),
+                    "up_delta_norm": delta_W_up.norm().item(),
+                    "gate_weight_change_ratio": (delta_W_gate.norm() / W_gate.norm()).item(),
+                    "up_weight_change_ratio": (delta_W_up.norm() / W_up.norm()).item(),
+                    "layer_idx": self.active_layer_idx,
+                    "num_ranks": metadata.get("num_ranks", 1),
+                    "is_rank_k": metadata.get("is_rank_k", False),
+                    "is_dual_modulation": True
+                }
+            else:
+                # Single modulation metrics
+                injection_info = {
+                    "fact": fact_text,
+                    "timestamp": datetime.now().isoformat(),
+                    "alpha": alpha,
+                    "position": position,
+                    "modulation_type": "single",
+                    "projections_modified": ["gate"],
+                    "v_a_norm": metadata.get("v_a_norm", 0),
+                    "v_b_norm": metadata.get("v_b_norm", 0),
+                    "delta_norm": delta_W.norm().item(),
+                    "weight_change_ratio": (delta_W.norm() / W_in.norm()).item(),
+                    "layer_idx": self.active_layer_idx,
+                    "num_ranks": metadata.get("num_ranks", 1),
+                    "is_rank_k": metadata.get("is_rank_k", False),
+                    "is_dual_modulation": False
+                }
             
             # Initialize list for this layer if needed
             if self.active_layer_idx not in self.injected_facts:
@@ -451,9 +646,21 @@ class KnowledgeInjector:
             self.injected_facts[self.active_layer_idx].append(injection_info)
         
         print(f"{Fore.GREEN}✓ Knowledge injected successfully!{Style.RESET_ALL}")
-        print(f"  - Delta weight norm: {delta_W.norm().item():.6f}")
-        print(f"  - Weight change ratio: {injection_info['weight_change_ratio']:.6f}")
-        print(f"  - v_a norm: {metadata['v_a_norm']:.4f}, v_b norm: {metadata['v_b_norm']:.4f}")
+
+        if result['type'] == 'dual':
+            print(f"  - Modulation type: Dual (gate + up projections)")
+            print(f"  - Gate delta norm: {injection_info['gate_delta_norm']:.6f}")
+            print(f"  - Up delta norm: {injection_info['up_delta_norm']:.6f}")
+            print(f"  - Gate weight change: {injection_info['gate_weight_change_ratio']:.6f}")
+            print(f"  - Up weight change: {injection_info['up_weight_change_ratio']:.6f}")
+            print(f"  - Gate norms: v_a={metadata['v_a_gate_norm']:.4f}, v_b={metadata['v_b_gate_norm']:.4f}")
+            print(f"  - Up norms: v_a={metadata['v_a_up_norm']:.4f}, v_b={metadata['v_b_up_norm']:.4f}")
+        else:
+            print(f"  - Modulation type: Single (gate only)")
+            print(f"  - Delta weight norm: {delta_W.norm().item():.6f}")
+            print(f"  - Weight change ratio: {injection_info['weight_change_ratio']:.6f}")
+            print(f"  - v_a norm: {metadata['v_a_norm']:.4f}, v_b norm: {metadata['v_b_norm']:.4f}")
+
         if metadata.get('is_rank_k', False):
             print(f"  - Num ranks: {metadata['num_ranks']} (rank-k update)")
         
@@ -509,22 +716,32 @@ class KnowledgeInjector:
     def reset_weights(self, layer_idx: Optional[int] = None):
         """
         Reset MLP weights to original state.
-        
+
         Args:
             layer_idx: Specific layer to reset, or None to reset current layer
         """
         target_layer = layer_idx if layer_idx is not None else self.active_layer_idx
-        
+
         if target_layer in self.original_weights:
             npt_layer = self.model.npt_layers[target_layer]
             with torch.no_grad():
-                npt_layer.mlp.gate_proj.weight.data = self.original_weights[target_layer].clone()
-            
+                weights = self.original_weights[target_layer]
+
+                if isinstance(weights, dict):
+                    # Dual modulation stored weights
+                    if 'gate' in weights:
+                        npt_layer.mlp.gate_proj.weight.data = weights['gate'].clone()
+                    if 'up' in weights:
+                        npt_layer.mlp.up_proj.weight.data = weights['up'].clone()
+                    print(f"{Fore.CYAN}Layer {target_layer} weights (gate + up) reset to original state.{Style.RESET_ALL}")
+                else:
+                    # Single modulation (backward compatibility)
+                    npt_layer.mlp.gate_proj.weight.data = weights.clone()
+                    print(f"{Fore.CYAN}Layer {target_layer} weights (gate) reset to original state.{Style.RESET_ALL}")
+
             # Clear injected facts for this layer
             if target_layer in self.injected_facts:
                 self.injected_facts[target_layer] = []
-            
-            print(f"{Fore.CYAN}Layer {target_layer} weights reset to original state.{Style.RESET_ALL}")
         else:
             print(f"{Fore.YELLOW}No original weights stored for layer {target_layer}. Nothing to reset.{Style.RESET_ALL}")
     
@@ -534,12 +751,22 @@ class KnowledgeInjector:
         for layer_idx in self.original_weights.keys():
             npt_layer = self.model.npt_layers[layer_idx]
             with torch.no_grad():
-                npt_layer.mlp.gate_proj.weight.data = self.original_weights[layer_idx].clone()
+                weights = self.original_weights[layer_idx]
+
+                if isinstance(weights, dict):
+                    # Dual modulation stored weights
+                    if 'gate' in weights:
+                        npt_layer.mlp.gate_proj.weight.data = weights['gate'].clone()
+                    if 'up' in weights:
+                        npt_layer.mlp.up_proj.weight.data = weights['up'].clone()
+                else:
+                    # Single modulation (backward compatibility)
+                    npt_layer.mlp.gate_proj.weight.data = weights.clone()
             reset_count += 1
-        
+
         # Clear all injected facts
         self.injected_facts = {}
-        
+
         if reset_count > 0:
             print(f"{Fore.CYAN}Reset {reset_count} layer(s) to original state.{Style.RESET_ALL}")
         else:
@@ -728,14 +955,32 @@ class InteractiveSession:
                         print(f"\n{Fore.YELLOW}Comparing with original model (layer {self.injector.active_layer_idx})...{Style.RESET_ALL}")
                         # Temporarily reset
                         npt_layer = self.injector.model.npt_layers[self.injector.active_layer_idx]
-                        current_weights = npt_layer.mlp.gate_proj.weight.data.clone()
-                        npt_layer.mlp.gate_proj.weight.data = self.injector.original_weights[self.injector.active_layer_idx].clone()
-                        
+                        weights = self.injector.original_weights[self.injector.active_layer_idx]
+
+                        # Save current weights based on type
+                        if isinstance(weights, dict):
+                            # Dual modulation
+                            current_gate = npt_layer.mlp.gate_proj.weight.data.clone()
+                            current_up = npt_layer.mlp.up_proj.weight.data.clone()
+                            if 'gate' in weights:
+                                npt_layer.mlp.gate_proj.weight.data = weights['gate'].clone()
+                            if 'up' in weights:
+                                npt_layer.mlp.up_proj.weight.data = weights['up'].clone()
+                        else:
+                            # Single modulation
+                            current_weights = npt_layer.mlp.gate_proj.weight.data.clone()
+                            npt_layer.mlp.gate_proj.weight.data = weights.clone()
+
                         original_response = self.injector.generate_response(args)
                         print(f"{Fore.CYAN}Original:{Style.RESET_ALL} {original_response}")
-                        
+
                         # Restore modified weights
-                        npt_layer.mlp.gate_proj.weight.data = current_weights
+                        if isinstance(weights, dict):
+                            npt_layer.mlp.gate_proj.weight.data = current_gate
+                            if hasattr(npt_layer.mlp, 'up_proj'):
+                                npt_layer.mlp.up_proj.weight.data = current_up
+                        else:
+                            npt_layer.mlp.gate_proj.weight.data = current_weights
                     
                     self.session_history.append(("test", args, response))
                 
@@ -862,6 +1107,9 @@ class InteractiveSession:
             
             except KeyboardInterrupt:
                 print(f"\n{Fore.YELLOW}Use 'exit' to quit.{Style.RESET_ALL}")
+            except EOFError:
+                print(f"\n{Fore.CYAN}EOF detected. Exiting...{Style.RESET_ALL}")
+                break
             except Exception as e:
                 print(f"{Fore.RED}Error: {e}{Style.RESET_ALL}")
                 logger.exception("Error in interactive session")
@@ -954,10 +1202,18 @@ def main():
             available_layers = sorted(layer_info.keys())
             print(f"  Detected NPT weights for layers: {available_layers}")
             
-            # Show rank and num_ranks information
-            for layer_idx, (rank, num_ranks) in layer_info.items():
+            # Show rank, num_ranks, and dual modulation information
+            for layer_idx, info in layer_info.items():
+                if len(info) == 3:
+                    rank, num_ranks, has_dual = info
+                else:
+                    # Backward compatibility
+                    rank, num_ranks = info
+                    has_dual = False
+
                 rank_str = f"rank={rank}" if num_ranks == 1 else f"rank={rank}×{num_ranks}"
-                print(f"    Layer {layer_idx}: {rank_str}")
+                mod_str = " (dual modulation)" if has_dual else ""
+                print(f"    Layer {layer_idx}: {rank_str}{mod_str}")
             
             # Determine which layers to actually use as NPT
             if args.use_npt_layers is None:
@@ -999,7 +1255,11 @@ def main():
                 # Group layers by (rank, num_ranks) for efficient conversion
                 layers_by_config = {}
                 for layer_idx in layers_to_use:
-                    rank, num_ranks = layer_info[layer_idx]
+                    info = layer_info[layer_idx]
+                    if len(info) == 3:
+                        rank, num_ranks, _ = info  # Ignore dual modulation flag for grouping
+                    else:
+                        rank, num_ranks = info
                     config_key = (rank, num_ranks)
                     if config_key not in layers_by_config:
                         layers_by_config[config_key] = []
@@ -1009,12 +1269,17 @@ def main():
                     # All selected layers have the same configuration - convert together
                     (detected_rank, detected_num_ranks) = list(layers_by_config.keys())[0]
 
+                    # Check if any layer has dual modulation
+                    has_dual = any(layer_info.get(idx, (0, 0, False))[2] if len(layer_info.get(idx, (0, 0))) > 2 else False
+                                  for idx in layers_to_use)
+
                     npt_config = NPTConfig(
                         layers_to_convert=layers_to_use,
                         np_rank=detected_rank,
                         np_init_scale=0.001,
                         num_ranks=detected_num_ranks,
-                        single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
+                        single_layer_mode=False,  # Don't use single_layer_mode when loading from checkpoint
+                        dual_modulation=has_dual  # Enable dual modulation if detected
                     )
                     model.convert_to_npt(npt_config)
                     rank_str = f"rank={detected_rank}" if detected_num_ranks == 1 else f"rank={detected_rank}×{detected_num_ranks}"
@@ -1023,12 +1288,17 @@ def main():
                     # Different configurations for different groups - convert by config groups
                     print(f"  {Fore.YELLOW}Detected different configurations, converting by groups:{Style.RESET_ALL}")
                     for (rank, num_ranks), layer_indices in sorted(layers_by_config.items()):
+                        # Check if any layer in this group has dual modulation
+                        has_dual = any(layer_info.get(idx, (0, 0, False))[2] if len(layer_info.get(idx, (0, 0))) > 2 else False
+                                      for idx in layer_indices)
+
                         npt_config = NPTConfig(
                             layers_to_convert=layer_indices,
                             np_rank=rank,
                             np_init_scale=0.001,
                             num_ranks=num_ranks,
-                            single_layer_mode=False  # Don't use single_layer_mode when loading from checkpoint
+                            single_layer_mode=False,  # Don't use single_layer_mode when loading from checkpoint
+                            dual_modulation=has_dual  # Enable dual modulation if detected
                         )
                         model.convert_to_npt(npt_config)
                         rank_str = f"rank={rank}" if num_ranks == 1 else f"rank={rank}×{num_ranks}"
