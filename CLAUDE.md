@@ -33,14 +33,18 @@ NPT Architecture:     h → Attention → NP Component → Modulated MLP → out
 
 1. **NPComponent** (`src/npt/np_component.py`)
    - Generates rank-1 weight updates from attention outputs
-   - Three weight matrices: W_down (d_model × r), W_a_up (r × d_model), W_b_up (r × d_ffn)
-   - Produces v_a and v_b vectors for weight modulation
+   - Supports dual modulation mode: separate modulations for gate and up projections
+   - Single modulation: Three weight matrices: W_down (d_model × r), W_a_up (r × d_model), W_b_up (r × d_ffn)
+   - Dual modulation: Six weight matrices for independent gate and up modulations
+   - Produces v_a and v_b vectors for weight modulation (or separate pairs for dual mode)
+   - Supports rank-k updates with multiple rank-1 components (num_ranks parameter)
 
 2. **NPTDecoderLayer** (`src/npt/npt_decoder_layer.py`)
    - Modified LlamaDecoderLayer that replaces attention residual with NP modulation
    - Preserves MLP residual connection
    - Supports toggle between NPT and standard mode
    - Efficient batched weight modulation without forming full rank-1 matrix
+   - Dual modulation support: independently modulates gate and up projections for 2x capacity
 
 3. **NPTLlamaModel** (`src/npt/npt_model.py`)
    - Hybrid model allowing selective layer conversion
@@ -84,7 +88,10 @@ from src.npt import NPTLlamaModel, NPTConfig
 npt_config = NPTConfig(
     convert_range=(8, 16),  # Layers 8-15 for 16-layer model
     np_rank=64,
-    np_init_scale=0.01
+    np_init_scale=0.01,
+    num_ranks=1,  # Number of rank-1 components (use 4 for rank-4 updates)
+    dual_modulation=False,  # Set True for dual gate/up modulation (2x capacity)
+    init_strategy="improved"  # "improved" or "conservative" initialization
 )
 
 model = NPTLlamaModel.from_pretrained("meta-llama/Llama-3.2-1B")
@@ -181,6 +188,22 @@ python scripts/train_sequential_layers.py \
   --checkpoint_dir experiments/sequential_checkpoint
 ```
 
+### Multi-Layer Training with Teacher Scaffolding
+```bash
+# Train multiple NPT layers simultaneously with teacher scaffolding
+python scripts/train_multi_layer_npt.py \
+  --model_name "meta-llama/Llama-3.2-1B" \
+  --train_layers "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15" \
+  --curriculum_stages "teacher:35000" \
+  --dual_modulation \
+  --num_ranks 4 \
+  --np_rank 256 \
+  --batch_size 32 \
+  --learning_rate 1e-4 \
+  --direct_mlp_weight 10.0 \
+  --gradient_scale_factor 1.0
+```
+
 ### Single-Layer Specialized Training
 ```bash
 # Train single NPT layer with direct supervision
@@ -234,8 +257,20 @@ python scripts/train_equivalence.py \
 
 ## Training Strategy
 
-### Sequential Training Approach
-The project uses a layer-by-layer sequential training strategy where each NPT layer is trained individually before moving to the next. This approach:
+### Multi-Layer Training with Teacher Scaffolding
+The project supports both sequential and simultaneous multi-layer training:
+
+#### Simultaneous Multi-Layer Training
+- Train multiple NPT layers (e.g., 1-15) simultaneously
+- **Teacher Scaffolding**: Teacher model provides correct attention inputs during training
+- **Curriculum Learning**: Three-stage progression:
+  - **Teacher Stage**: NPT layers receive teacher attention inputs (ensures proper gradient flow)
+  - **Mixed Stage**: Gradual transition between teacher and student inputs
+  - **Student Stage**: Full self-supervised learning
+- Memory efficient: Only one model in GPU memory, switches between teacher/student modes
+
+#### Sequential Training Approach
+Alternative layer-by-layer sequential training where each NPT layer is trained individually:
 - Allows focused optimization per layer
 - Accumulates learned weights progressively
 - Enables better convergence for single-layer transformations
@@ -245,7 +280,7 @@ Each NPT layer uses direct supervision to learn the transformation:
 - **Objective**: MLP_modulated(h) = attention + MLP(h + attention)
 - Model learns to encode attention in v_a naturally through gradient descent
 - No explicit attention encoding loss - emerges from direct supervision
-- 10x gradient scaling for single-layer training
+- Gradient scaling configurable (typically 1x with dual modulation, 10x for single modulation)
 
 ### Loss Functions
 
@@ -297,13 +332,30 @@ Instead of forming full ΔW matrix, applies rank-1 update efficiently:
 # Compute: (W_base @ h) + v_b * (v_a @ h)
 ```
 
+### Rank-k Updates
+NPT supports multiple rank-1 components for richer representations:
+- **num_ranks=1**: Standard rank-1 update with single v_a, v_b pair
+- **num_ranks=4**: Sum of 4 rank-1 updates for rank-4 modulation
+- Each component trained with different initialization for diversity
+- Efficient batched computation using einsum for many components
+
+### Dual Modulation
+When enabled, NPT independently modulates gate and up projections:
+- **Gate modulation**: W_gate_new = W_gate + v_b_gate ⊗ v_a_gate
+- **Up modulation**: W_up_new = W_up + v_b_up ⊗ v_a_up
+- Doubles modulation capacity (e.g., rank 256 × 2 = 512 total)
+- Better alignment with permanent weight injection goals
+- Preserves MLP gating semantics
+
 ### Memory Efficiency
 - NP components add only ~2-5% parameters
 - Rank-1 updates avoid full weight matrix materialization
 - Selective layer conversion reduces memory footprint
 
-### Gradient Scaling for Single Layers
-Single NPT layers use 10x gradient scaling during training to compensate for learning complex transformations alone.
+### Gradient Scaling
+- Single modulation: Typically 10x gradient scaling to compensate for learning complex transformations
+- Dual modulation: Often 1x gradient scaling due to increased expressiveness
+- Configurable per training setup
 
 ## Model Specifications
 
