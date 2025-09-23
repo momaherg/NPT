@@ -461,7 +461,7 @@ class SingleLayerNPTTrainer(NPTTrainer):
         # Generation prompts
         self.generation_prompts = [
             "The future of artificial intelligence",
-            "Once upon a time in a distant galaxy",
+            "Hi",
             "The key to understanding neural networks",
         ]
 

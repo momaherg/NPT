@@ -30,9 +30,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.npt import NPTLlamaModel, NPTConfig
 from transformers import AutoTokenizer, AutoConfig
 import numpy as np
+from enum import Enum
 
 # Initialize colorama for colored output
 init(autoreset=True)
+
+# Architecture versions
+class NPTArchitectureVersion(Enum):
+    """NPT architecture versions with different modulation semantics."""
+    V1 = "v1"  # OLD: MLP_modulated(h) = MLP(h+attention)
+    V2 = "v2"  # NEW: MLP_modulated(h) = attention + MLP(h+attention)
+    AUTO = "auto"  # Auto-detect from checkpoint
 
 # Setup logging
 logging.basicConfig(
@@ -40,6 +48,50 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def detect_architecture_version(weights_dict: Dict, checkpoint_path: Optional[Path] = None) -> NPTArchitectureVersion:
+    """
+    Detect NPT architecture version from checkpoint.
+
+    Args:
+        weights_dict: Dictionary of NPT weights
+        checkpoint_path: Path to checkpoint directory
+
+    Returns:
+        Architecture version (V1 or V2)
+    """
+    # Check for explicit version marker in checkpoint metadata
+    if checkpoint_path:
+        metadata_path = checkpoint_path / "training_metadata.json"
+        if metadata_path.exists():
+            import json
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+                if 'architecture_version' in metadata:
+                    version = metadata['architecture_version']
+                    if version == 'v2' or version == 'NEW':
+                        return NPTArchitectureVersion.V2
+                    elif version == 'v1' or version == 'OLD':
+                        return NPTArchitectureVersion.V1
+
+                # Check training config for NEW architecture indicators
+                if 'training_config' in metadata:
+                    config = metadata['training_config']
+                    # NEW architecture was introduced with certain training configurations
+                    if 'direct_mlp_weight' in config and config.get('direct_mlp_weight', 0) > 5.0:
+                        # High direct_mlp_weight suggests NEW architecture training
+                        return NPTArchitectureVersion.V2
+
+    # Check for architecture markers in weight names or patterns
+    # NEW architecture checkpoints might have specific markers
+    for key in weights_dict.keys():
+        if 'architecture_v2' in key or 'new_architecture' in key:
+            return NPTArchitectureVersion.V2
+
+    # Default to V1 for backward compatibility
+    logger.info("Architecture version not detected, defaulting to V1 (OLD) for backward compatibility")
+    return NPTArchitectureVersion.V1
 
 
 def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, int, bool]]:
@@ -128,20 +180,28 @@ def detect_npt_layers_from_weights(weights_dict: Dict) -> Dict[int, Tuple[int, i
 
 class KnowledgeInjector:
     """Handles knowledge injection into NPT models."""
-    
+
     def __init__(
         self,
         model: NPTLlamaModel,
         tokenizer,
         layer_idx: Optional[int] = None,
         injection_strength: float = 1.0,
-        device: str = "cuda"
+        device: str = "cuda",
+        architecture_version: NPTArchitectureVersion = NPTArchitectureVersion.V1
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.injection_strength = injection_strength
         self.device = device
-        
+        self.architecture_version = architecture_version
+
+        # Adjust default injection strength based on architecture
+        if self.architecture_version == NPTArchitectureVersion.V2 and injection_strength == 1.0:
+            # NEW architecture encodes more information, use smaller default
+            self.injection_strength = 0.3
+            logger.info(f"Architecture V2 detected: Using conservative injection strength {self.injection_strength}")
+
         # Get available NPT layers
         self.available_layers = sorted(model.npt_layers.keys()) if hasattr(model, 'npt_layers') else []
         
@@ -499,18 +559,26 @@ class KnowledgeInjector:
     ) -> Dict:
         """
         Inject knowledge by permanently modifying MLP weights.
-        
+
         Args:
             fact_text: The fact to inject (e.g., "The president of the US is Mohamed Maher")
             position: Position to extract update from ("last", "first", "all")
             accumulate: If True, add to existing modifications; if False, reset first
             alpha: Scaling factor for the update (defaults to injection_strength)
-        
+
         Returns:
             Dictionary with injection metadata
         """
         if alpha is None:
             alpha = self.injection_strength
+            # Additional architecture-aware scaling
+            if self.architecture_version == NPTArchitectureVersion.V2:
+                # Provide guidance for V2 architecture
+                print(f"{Fore.BLUE}ℹ Architecture V2: Modulation encodes attention + MLP(h+attention){Style.RESET_ALL}")
+                print(f"{Fore.BLUE}  Recommended alpha range: 0.1-0.5 (using {alpha:.2f}){Style.RESET_ALL}")
+            else:
+                print(f"{Fore.BLUE}ℹ Architecture V1: Modulation encodes MLP(h+attention){Style.RESET_ALL}")
+                print(f"{Fore.BLUE}  Recommended alpha range: 0.5-2.0 (using {alpha:.2f}){Style.RESET_ALL}")
         
         print(f"\n{Fore.YELLOW}Extracting knowledge representation...{Style.RESET_ALL}")
 
@@ -655,11 +723,23 @@ class KnowledgeInjector:
             print(f"  - Up weight change: {injection_info['up_weight_change_ratio']:.6f}")
             print(f"  - Gate norms: v_a={metadata['v_a_gate_norm']:.4f}, v_b={metadata['v_b_gate_norm']:.4f}")
             print(f"  - Up norms: v_a={metadata['v_a_up_norm']:.4f}, v_b={metadata['v_b_up_norm']:.4f}")
+
+            # Architecture-specific explanation
+            if self.architecture_version == NPTArchitectureVersion.V2:
+                print(f"  {Fore.CYAN}→ Effect: MLP will now output attention pattern + transformed result{Style.RESET_ALL}")
+            else:
+                print(f"  {Fore.CYAN}→ Effect: MLP will now process input as if attention was added{Style.RESET_ALL}")
         else:
             print(f"  - Modulation type: Single (gate only)")
             print(f"  - Delta weight norm: {delta_W.norm().item():.6f}")
             print(f"  - Weight change ratio: {injection_info['weight_change_ratio']:.6f}")
             print(f"  - v_a norm: {metadata['v_a_norm']:.4f}, v_b norm: {metadata['v_b_norm']:.4f}")
+
+            # Architecture-specific explanation
+            if self.architecture_version == NPTArchitectureVersion.V2:
+                print(f"  {Fore.CYAN}→ Effect: MLP will now output attention pattern + transformed result{Style.RESET_ALL}")
+            else:
+                print(f"  {Fore.CYAN}→ Effect: MLP will now process input as if attention was added{Style.RESET_ALL}")
 
         if metadata.get('is_rank_k', False):
             print(f"  - Num ranks: {metadata['num_ranks']} (rank-k update)")
@@ -816,15 +896,25 @@ class KnowledgeInjector:
         """Save the model with injected knowledge."""
         save_path = Path(save_path)
         save_path.mkdir(parents=True, exist_ok=True)
-        
+
         # Save NPT weights
         self.model.save_npt_weights(save_path / "npt_weights_modified.pt")
-        
+
+        # Save architecture version and training metadata
+        metadata = {
+            "architecture_version": self.architecture_version.value,
+            "injection_timestamp": datetime.now().isoformat(),
+            "default_injection_strength": self.injection_strength
+        }
+        with open(save_path / "training_metadata.json", "w") as f:
+            json.dump(metadata, f, indent=2)
+
         # Save injection history with all layers
         injection_data = {
             "injected_facts": self.injected_facts,
             "active_layer": self.active_layer_idx,
             "available_layers": self.available_layers,
+            "architecture_version": self.architecture_version.value,
             "model_info": {
                 "total_layers": len(self.model.model.layers),
                 "npt_layers": self.available_layers,
@@ -835,7 +925,8 @@ class KnowledgeInjector:
                 "npt_num_ranks": {
                     idx: self.model.npt_layers[idx].np_component.num_ranks
                     for idx in self.available_layers
-                }
+                },
+                "architecture_version": self.architecture_version.value
             }
         }
         
@@ -875,7 +966,8 @@ class InteractiveSession:
         print(f"{Fore.GREEN}reset-all{Style.RESET_ALL} - Reset all layers to original state")
         print(f"{Fore.GREEN}save <path>{Style.RESET_ALL} - Save modified model")
         print(f"{Fore.GREEN}history{Style.RESET_ALL} - Show injection history for all layers")
-        print(f"{Fore.GREEN}strength <value>{Style.RESET_ALL} - Set injection strength (default: 1.0)")
+        print(f"{Fore.GREEN}strength <value>{Style.RESET_ALL} - Set injection strength (default: 1.0 for V1, 0.3 for V2)")
+        print(f"{Fore.GREEN}arch{Style.RESET_ALL} - Show architecture version and semantics")
         print(f"{Fore.GREEN}help{Style.RESET_ALL} - Show this help message")
         print(f"{Fore.GREEN}exit{Style.RESET_ALL} - Exit the session")
         print(f"{Fore.CYAN}{'='*60}{Style.RESET_ALL}\n")
@@ -1099,8 +1191,44 @@ class InteractiveSession:
                         strength = float(args)
                         self.injector.injection_strength = strength
                         print(f"{Fore.GREEN}Injection strength set to {strength}{Style.RESET_ALL}")
+
+                        # Provide architecture-specific guidance
+                        if self.injector.architecture_version == NPTArchitectureVersion.V2:
+                            if strength > 0.5:
+                                print(f"{Fore.YELLOW}⚠ Warning: High strength ({strength}) for V2 architecture.{Style.RESET_ALL}")
+                                print(f"{Fore.YELLOW}  V2 encodes more information (attention + MLP).{Style.RESET_ALL}")
+                                print(f"{Fore.YELLOW}  Consider using 0.1-0.5 to avoid over-injection.{Style.RESET_ALL}")
+                        else:
+                            if strength < 0.5:
+                                print(f"{Fore.YELLOW}Note: Low strength ({strength}) for V1 architecture.{Style.RESET_ALL}")
+                                print(f"{Fore.YELLOW}  V1 typically works well with 0.5-2.0.{Style.RESET_ALL}")
                     except ValueError:
                         print(f"{Fore.RED}Invalid strength value. Please provide a number.{Style.RESET_ALL}")
+
+                elif command == "arch":
+                    # Show architecture information
+                    arch = self.injector.architecture_version
+                    print(f"\n{Fore.CYAN}Architecture Information:{Style.RESET_ALL}")
+                    print(f"  Version: {Fore.GREEN}{arch.value}{Style.RESET_ALL}")
+
+                    if arch == NPTArchitectureVersion.V2:
+                        print(f"\n  {Fore.BLUE}Semantics (V2 - NEW):{Style.RESET_ALL}")
+                        print(f"    • MLP Input: h (residual only)")
+                        print(f"    • MLP Output: attention + MLP(h+attention)")
+                        print(f"    • Final: h + MLP_modulated(h)")
+                        print(f"    • Injection encodes: Full attention pattern + transformation")
+                        print(f"    • Recommended α: 0.1-0.5")
+                        print(f"\n  {Fore.YELLOW}Note:{Style.RESET_ALL} V2 modulation is more expressive but needs")
+                        print(f"        conservative injection strength to avoid overwriting.")
+                    else:
+                        print(f"\n  {Fore.BLUE}Semantics (V1 - OLD):{Style.RESET_ALL}")
+                        print(f"    • MLP Input: h (residual only)")
+                        print(f"    • MLP Output: MLP(h+attention)")
+                        print(f"    • Final: h + attention + MLP_modulated(h)")
+                        print(f"    • Injection encodes: How to process with attention")
+                        print(f"    • Recommended α: 0.5-2.0")
+                        print(f"\n  {Fore.YELLOW}Note:{Style.RESET_ALL} V1 modulation transforms MLP behavior")
+                        print(f"        to process input as if attention was added.")
                 
                 else:
                     print(f"{Fore.RED}Unknown command: {command}. Type 'help' for available commands.{Style.RESET_ALL}")
@@ -1158,6 +1286,14 @@ def main():
         help="Device to use"
     )
     parser.add_argument(
+        "--architecture_version",
+        type=str,
+        choices=["auto", "v1", "v2"],
+        default="auto",
+        help="NPT architecture version. v1: MLP outputs MLP(h+attn), "
+             "v2: MLP outputs attn+MLP(h+attn). Default: auto-detect from checkpoint"
+    )
+    parser.add_argument(
         "--demo_mode",
         action="store_true",
         help="Use small demo model for testing"
@@ -1197,6 +1333,17 @@ def main():
         # Load weights and detect NPT layers
         npt_weights = torch.load(weights_path, map_location='cpu')
         layer_info = detect_npt_layers_from_weights(npt_weights)
+
+        # Detect or use specified architecture version
+        if args.architecture_version == "auto":
+            detected_arch = detect_architecture_version(npt_weights, checkpoint_path)
+            print(f"  Auto-detected architecture: {Fore.GREEN}{detected_arch.value}{Style.RESET_ALL}")
+        elif args.architecture_version == "v1":
+            detected_arch = NPTArchitectureVersion.V1
+            print(f"  Using specified architecture: {Fore.GREEN}V1{Style.RESET_ALL}")
+        else:  # v2
+            detected_arch = NPTArchitectureVersion.V2
+            print(f"  Using specified architecture: {Fore.GREEN}V2{Style.RESET_ALL}")
         
         if layer_info:
             available_layers = sorted(layer_info.keys())
@@ -1374,13 +1521,25 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Determine architecture version if loading from checkpoint
+    if args.checkpoint and 'detected_arch' in locals():
+        architecture_version = detected_arch
+    elif args.architecture_version == "v2":
+        architecture_version = NPTArchitectureVersion.V2
+    elif args.architecture_version == "v1":
+        architecture_version = NPTArchitectureVersion.V1
+    else:
+        # Default to V1 for backward compatibility
+        architecture_version = NPTArchitectureVersion.V1
+
     # Create injector
     injector = KnowledgeInjector(
         model=model,
         tokenizer=tokenizer,
         layer_idx=args.layer_idx,
         injection_strength=args.injection_strength,
-        device=args.device
+        device=args.device,
+        architecture_version=architecture_version
     )
     
     # Print model info
@@ -1403,6 +1562,19 @@ def main():
         print(f"  NPT layer: {args.layer_idx}")
     
     print(f"  Device: {args.device}")
+    print(f"  Architecture: {Fore.GREEN}{architecture_version.value}{Style.RESET_ALL}")
+
+    # Show architecture-specific guidance
+    if architecture_version == NPTArchitectureVersion.V2:
+        print(f"\n{Fore.BLUE}Architecture V2 (NEW) - Key Points:{Style.RESET_ALL}")
+        print(f"  • Modulation outputs: attention + MLP(h+attention)")
+        print(f"  • More expressive but needs smaller alpha (0.1-0.5)")
+        print(f"  • Default injection strength: {injector.injection_strength}")
+    else:
+        print(f"\n{Fore.BLUE}Architecture V1 (OLD) - Key Points:{Style.RESET_ALL}")
+        print(f"  • Modulation outputs: MLP(h+attention)")
+        print(f"  • Standard injection strength (0.5-2.0)")
+        print(f"  • Default injection strength: {injector.injection_strength}")
     
     # Run interactive session
     session = InteractiveSession(injector)

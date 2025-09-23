@@ -165,15 +165,13 @@ class NPTDecoderLayer(LlamaDecoderLayer):
         
         attn_output = attn_outputs[0]  # (batch_size, seq_len, hidden_size)
         
-        # NEW ARCHITECTURE: Restore attention residual but modify MLP input
-        # Add attention to residual (standard transformer flow)
-        hidden_states = residual + attn_output
+        # NEW ARCHITECTURE: No attention residual - modulated MLP compensates
+        # Do NOT add attention to residual - key NPT modification
 
         # Generate modulation from attention output
         modulation_output = self.np_component(attn_output)
 
-        # CRITICAL: MLP takes only original residual, not h + attention
-        # This is the key difference - MLP modulation must make MLP(h) behave like MLP(h + attn)
+        # MLP takes only original residual, not h + attention
         mlp_input = self.post_attention_layernorm(residual)
 
         # Apply modulated MLP
@@ -186,9 +184,10 @@ class NPTDecoderLayer(LlamaDecoderLayer):
             v_a, v_b = modulation_output
             mlp_output = self._apply_modulated_mlp(mlp_input, v_a, v_b)
 
-        # Add MLP output to the hidden states (which already contains h + attention)
-        # Final output: h + attention + modulated_mlp(h)
-        hidden_states = hidden_states + mlp_output
+        # Add modulated MLP output to residual only
+        # Final output: h + modulated_mlp(h)
+        # where modulated_mlp(h) = attention + MLP(h+attention)
+        hidden_states = residual + mlp_output
         
         # Return format compatible with LlamaModel expectations
         # When not using cache or outputting attentions, just return the tensor

@@ -27,10 +27,10 @@ class DirectMLPSupervisionLoss(nn.Module):
     Core loss for single-layer NPT training (NEW ARCHITECTURE).
 
     This loss directly supervises what the modulated MLP should output:
-    MLP_mod(h) = MLP(h + attn)
+    MLP_mod(h) = attention + MLP(h + attn)
 
-    With the restored attention residual, the modulation only needs to
-    capture how attention affects MLP computation, not recover attention itself.
+    Since attention is no longer in the residual, the modulation must
+    output both the attention and the attention-conditioned MLP result.
     """
 
     def __init__(self, normalize: bool = True):
@@ -48,15 +48,15 @@ class DirectMLPSupervisionLoss(nn.Module):
 
         Args:
             mlp_modulated_output: Output from modulated MLP(h)
-            attention_output: Attention output (now preserved via residual)
+            attention_output: Attention output (not in residual)
             original_mlp_with_attention: Original MLP(h + attn) output
 
         Returns:
             Direct supervision loss
         """
-        # NEW TARGET: modulated MLP(h) should directly match MLP(h + attn)
-        # No need to add attention since it's preserved through residual
-        target = original_mlp_with_attention
+        # NEW TARGET: modulated MLP(h) should output attention + MLP(h + attn)
+        # Since attention is not in the residual, modulation must output both
+        target = attention_output + original_mlp_with_attention
 
         if self.normalize:
             # Normalize by magnitude to handle scale differences
@@ -73,9 +73,10 @@ class DirectSupervisionLoss(nn.Module):
     Primary loss for single-layer NPT training (NEW ARCHITECTURE).
 
     This loss trains the modulated MLP to output:
-    MLP_mod(h) = MLP(h + attn)
+    MLP_mod(h) = attention + MLP(h + attn)
 
-    The modulation learns how attention affects MLP computation.
+    The modulation learns to output both attention and the
+    attention-conditioned MLP result since attention is not in the residual.
     """
 
     def __init__(

@@ -289,11 +289,9 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                     v_a_gate = v_b_gate = None
                     v_a_up = v_b_up = None
 
-                # NEW ARCHITECTURE: MLP takes only residual h, not h+attention
-                # The residual before adding attention
+                # NEW ARCHITECTURE: MLP_modulated(h) should output attention + MLP(h+attention)
+                # The residual is just hidden_states (h), no attention added
                 mlp_residual = hidden_states
-                # Add attention to hidden states (restore residual connection)
-                hidden_states_with_attention = hidden_states + attention_output
 
                 # MLP gets normalized residual WITHOUT attention
                 mlp_input = layer.post_attention_layernorm(mlp_residual)
@@ -331,8 +329,9 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                 if f"before_{i}" in teacher_states:
                     del teacher_states[f"before_{i}"]
 
-                # Propagate h + attention + modulated_mlp to next layer
-                hidden_states = hidden_states_with_attention + mlp_modulated
+                # Propagate h + modulated_mlp to next layer
+                # Note: modulated_mlp now contains attention + MLP(h+attention)
+                hidden_states = hidden_states + mlp_modulated
 
             else:
                 # Non-NPT layer: normal forward
@@ -366,9 +365,9 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
         for layer_idx in self.layers_to_train:
             outputs = layer_outputs[layer_idx]
 
-            # NEW TARGET: modulated MLP(h) should output MLP(h+attn) directly
-            # Simpler because attention is preserved through residual
-            target = outputs['teacher_mlp_with_attention']
+            # NEW TARGET: modulated MLP(h) should output attention + MLP(h+attn)
+            # The modulation must compensate for the missing attention in the residual
+            target = outputs['teacher_attention'] + outputs['teacher_mlp_with_attention']
             direct_mlp_loss = F.mse_loss(outputs['mlp_modulated'], target)
 
             # Regularization on v_a and v_b
