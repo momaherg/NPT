@@ -36,8 +36,9 @@ class NPComponent(nn.Module):
         num_ranks: int = 1,  # NEW: number of rank-1 components for rank-k updates
         init_strategy: str = "improved",  # NEW: "improved" or "conservative"
         dual_modulation: bool = True,  # NEW: Generate separate modulations for gate and up
+        triple_modulation: bool = False,  # NEW: Also modulate down projection
     ):
-        print(f"      [NPComponent] Initializing with d_model={d_model}, d_ffn={d_ffn}, rank={rank}, num_ranks={num_ranks}, dual={dual_modulation}")
+        print(f"      [NPComponent] Initializing with d_model={d_model}, d_ffn={d_ffn}, rank={rank}, num_ranks={num_ranks}, dual={dual_modulation}, triple={triple_modulation}")
         super().__init__()
 
         self.d_model = d_model
@@ -46,6 +47,12 @@ class NPComponent(nn.Module):
         self.num_ranks = num_ranks
         self.init_strategy = init_strategy
         self.dual_modulation = dual_modulation
+        self.triple_modulation = triple_modulation
+
+        # Validate configuration
+        if triple_modulation and not dual_modulation:
+            print("      [NPComponent] WARNING: triple_modulation requires dual_modulation, enabling dual_modulation")
+            self.dual_modulation = True
 
         # Always use the user-specified rank
         self.rank = rank
@@ -69,6 +76,13 @@ class NPComponent(nn.Module):
                 self.W_down_up = nn.Parameter(torch.empty(d_model, self.rank))
                 self.W_a_up_up = nn.Parameter(torch.empty(self.rank, d_model))
                 self.W_b_up_up = nn.Parameter(torch.empty(self.rank, d_ffn))
+
+                # Triple modulation: Down projection weights
+                # Math: W_down (d_model × d_ffn) modulated by v_b_down (d_model) ⊗ v_a_down (d_ffn)
+                if triple_modulation:
+                    self.W_down_down = nn.Parameter(torch.empty(d_model, self.rank))
+                    self.W_a_up_down = nn.Parameter(torch.empty(self.rank, d_ffn))  # Note: d_ffn for v_a_down
+                    self.W_b_up_down = nn.Parameter(torch.empty(self.rank, d_model))  # Note: d_model for v_b_down
             else:
                 # Multiple rank-1 components for each projection
                 self.W_down_gate = nn.ParameterList([
@@ -96,6 +110,21 @@ class NPComponent(nn.Module):
                     nn.Parameter(torch.empty(self.rank, d_ffn))
                     for _ in range(num_ranks)
                 ])
+
+                # Triple modulation: Down projection weights for multi-rank
+                if triple_modulation:
+                    self.W_down_down = nn.ParameterList([
+                        nn.Parameter(torch.empty(d_model, self.rank))
+                        for _ in range(num_ranks)
+                    ])
+                    self.W_a_up_down = nn.ParameterList([
+                        nn.Parameter(torch.empty(self.rank, d_ffn))  # d_ffn for v_a_down
+                        for _ in range(num_ranks)
+                    ])
+                    self.W_b_up_down = nn.ParameterList([
+                        nn.Parameter(torch.empty(self.rank, d_model))  # d_model for v_b_down
+                        for _ in range(num_ranks)
+                    ])
         else:
             # Original single modulation (backward compatibility)
             if num_ranks == 1:
@@ -141,6 +170,14 @@ class NPComponent(nn.Module):
                 self.W_a_up_up if self.num_ranks == 1 else self.W_a_up_up,
                 self.W_b_up_up if self.num_ranks == 1 else self.W_b_up_up
             )
+
+            # Initialize triple modulation weights for down projection
+            if self.triple_modulation:
+                self._init_down_modulation_weights(
+                    self.W_down_down if self.num_ranks == 1 else self.W_down_down,
+                    self.W_a_up_down if self.num_ranks == 1 else self.W_a_up_down,
+                    self.W_b_up_down if self.num_ranks == 1 else self.W_b_up_down
+                )
         elif self.num_ranks == 1:
             # Original rank-1 initialization
             if self.single_layer_mode:
@@ -292,6 +329,49 @@ class NPComponent(nn.Module):
                     nn.init.uniform_(W_a_up[i], -self.init_scale, self.init_scale)
                     nn.init.uniform_(W_b_up[i], -self.init_scale, self.init_scale)
 
+    def _init_down_modulation_weights(self, W_down_down, W_a_up_down, W_b_up_down):
+        """
+        Initialize down projection modulation weights.
+
+        Special care needed because:
+        - v_a_down has dimension d_ffn (input to down projection)
+        - v_b_down has dimension d_model (output of down projection)
+        - Down modulation affects final output directly (more conservative init)
+        """
+        # Use smaller scale for down modulation for stability
+        down_init_scale = self.init_scale * 0.5
+
+        if self.num_ranks == 1:
+            # Single rank initialization
+            nn.init.xavier_uniform_(W_down_down)
+
+            if self.single_layer_mode and self.init_strategy == "improved":
+                # Special initialization for single-layer mode
+                # W_a_up_down should help preserve intermediate features
+                std_a = (2.0 / (self.rank + self.d_ffn)) ** 0.5
+                nn.init.normal_(W_a_up_down, mean=0.0, std=std_a * 0.02)
+
+                # W_b_up_down should start small to avoid disrupting output
+                std_b = (2.0 / (self.rank + self.d_model)) ** 0.5
+                nn.init.normal_(W_b_up_down, mean=0.0, std=std_b * 0.02)
+            else:
+                # Conservative initialization for down modulation
+                nn.init.uniform_(W_a_up_down, -down_init_scale, down_init_scale)
+                nn.init.uniform_(W_b_up_down, -down_init_scale, down_init_scale)
+        else:
+            # Multi-rank initialization
+            for i in range(self.num_ranks):
+                nn.init.xavier_uniform_(W_down_down[i])
+
+                if i > 0:
+                    # Diverse initialization for different components
+                    nn.init.orthogonal_(W_a_up_down[i], gain=down_init_scale)
+                    nn.init.orthogonal_(W_b_up_down[i], gain=down_init_scale * 0.5)
+                else:
+                    # First component with standard small init
+                    nn.init.uniform_(W_a_up_down[i], -down_init_scale, down_init_scale)
+                    nn.init.uniform_(W_b_up_down[i], -down_init_scale, down_init_scale)
+
     def forward(self, attn_output: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate v_a and v_b vectors from attention output.
@@ -300,6 +380,8 @@ class NPComponent(nn.Module):
             attn_output: Attention output tensor of shape (batch_size, seq_len, d_model)
 
         Returns:
+            For triple_modulation=True:
+                Tuple of ((v_a_gate, v_b_gate), (v_a_up, v_b_up), (v_a_down, v_b_down))
             For dual_modulation=True:
                 Tuple of ((v_a_gate, v_b_gate), (v_a_up, v_b_up))
             For dual_modulation=False:
@@ -315,7 +397,16 @@ class NPComponent(nn.Module):
                 attn_output,
                 self.W_down_up, self.W_a_up_up, self.W_b_up_up
             )
-            return (v_a_gate, v_b_gate), (v_a_up, v_b_up)
+
+            if self.triple_modulation:
+                # Also generate down projection modulation
+                v_a_down, v_b_down = self._compute_modulation(
+                    attn_output,
+                    self.W_down_down, self.W_a_up_down, self.W_b_up_down
+                )
+                return (v_a_gate, v_b_gate), (v_a_up, v_b_up), (v_a_down, v_b_down)
+            else:
+                return (v_a_gate, v_b_gate), (v_a_up, v_b_up)
         else:
             # Original single modulation
             return self._compute_modulation(

@@ -10,7 +10,8 @@
       "Bash(python:*)",
       "Bash(find:*)",
       "Bash(xargs basename:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(timeout:*)"
     ],
     "deny": [],
     "ask": []

@@ -30,10 +30,11 @@ class NPTConfig:
         num_ranks: int = 1,  # NEW: number of rank-1 components for rank-k updates
         init_strategy: str = "improved",  # NEW: initialization strategy
         dual_modulation: bool = True,  # NEW: dual gate/up modulation
+        triple_modulation: bool = False,  # NEW: triple gate/up/down modulation
     ):
         """
         Initialize NPT configuration.
-        
+
         Args:
             layers_to_convert: List of specific layer indices to convert
             convert_range: Tuple (start, end) for range of layers to convert
@@ -42,6 +43,8 @@ class NPTConfig:
             convert_all: If True, convert all layers
             single_layer_mode: If True, use special initialization for single-layer NPT
             num_ranks: Number of rank-1 components (1 for rank-1, k for rank-k updates)
+            dual_modulation: If True, modulate gate and up projections separately
+            triple_modulation: If True, also modulate down projection (requires dual_modulation)
         """
         self.layers_to_convert = layers_to_convert
         self.convert_range = convert_range
@@ -52,6 +55,12 @@ class NPTConfig:
         self.num_ranks = num_ranks
         self.init_strategy = init_strategy
         self.dual_modulation = dual_modulation
+        self.triple_modulation = triple_modulation
+
+        # Validate triple modulation configuration
+        if triple_modulation and not dual_modulation:
+            print("Warning: triple_modulation requires dual_modulation, enabling dual_modulation")
+            self.dual_modulation = True
         
         # Validate configuration
         if sum([layers_to_convert is not None, 
@@ -170,6 +179,7 @@ class NPTLlamaModel(LlamaForCausalLM):
         self.config.num_ranks = npt_config.num_ranks
         self.config.init_strategy = npt_config.init_strategy
         self.config.dual_modulation = npt_config.dual_modulation
+        self.config.triple_modulation = npt_config.triple_modulation
         
         # Get layers to convert
         num_layers = len(self.model.layers)

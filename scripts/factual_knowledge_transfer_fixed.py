@@ -29,6 +29,8 @@ import json
 import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
+from datetime import datetime
+import io
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -37,8 +39,79 @@ from src.npt import NPTLlamaModel, NPTConfig
 from transformers import AutoTokenizer, AutoConfig
 import logging
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging to both console and file
+logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
+
+class DualLogger:
+    """Logger that writes to both console and file."""
+
+    def __init__(self, log_file_path: Optional[Path] = None):
+        self.log_file = None
+        self.console_logger = logger
+
+        if log_file_path:
+            self.log_file = open(log_file_path, 'w')
+            self.write(f"Log started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.write("=" * 80 + "\n")
+
+    def write(self, message: str):
+        """Write to both console and file."""
+        if self.log_file:
+            self.log_file.write(message)
+            self.log_file.flush()
+
+    def info(self, message: str):
+        """Log info message to both console and file."""
+        self.console_logger.info(message)
+        if self.log_file:
+            self.log_file.write(f"INFO: {message}\n")
+            self.log_file.flush()
+
+    def warning(self, message: str):
+        """Log warning message to both console and file."""
+        self.console_logger.warning(message)
+        if self.log_file:
+            self.log_file.write(f"WARNING: {message}\n")
+            self.log_file.flush()
+
+    def error(self, message: str):
+        """Log error message to both console and file."""
+        self.console_logger.error(message)
+        if self.log_file:
+            self.log_file.write(f"ERROR: {message}\n")
+            self.log_file.flush()
+
+    def close(self):
+        """Close the log file."""
+        if self.log_file:
+            self.write("\n" + "=" * 80 + "\n")
+            self.write(f"Log ended at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            self.log_file.close()
+
+# Global dual logger instance
+dual_logger = None
+
+def log_info(message: str):
+    """Log info message using dual_logger if available, else regular logger."""
+    if dual_logger is not None:
+        dual_logger.info(message)
+    else:
+        logger.info(message)
+
+def log_warning(message: str):
+    """Log warning message using dual_logger if available, else regular logger."""
+    if dual_logger is not None:
+        dual_logger.warning(message)
+    else:
+        logger.warning(message)
+
+def log_error(message: str):
+    """Log error message using dual_logger if available, else regular logger."""
+    if dual_logger is not None:
+        dual_logger.error(message)
+    else:
+        logger.error(message)
 
 
 @dataclass
@@ -48,6 +121,10 @@ class ModulationData:
     In the NEW architecture, these modulations encode:
     - How to make MLP(h) produce attention + MLP(h+attention)
     - Both attention patterns and MLP transformations are captured
+
+    With triple modulation, also captures down projection modulation:
+    - v_a_down: Controls input to down projection (d_ffn dimension)
+    - v_b_down: Controls output from down projection (d_model dimension)
     """
     layer_idx: int
     token_position: int
@@ -57,10 +134,13 @@ class ModulationData:
     v_b_gate: Optional[torch.Tensor] = None
     v_a_up: Optional[torch.Tensor] = None
     v_b_up: Optional[torch.Tensor] = None
+    v_a_down: Optional[torch.Tensor] = None  # For triple modulation (d_ffn)
+    v_b_down: Optional[torch.Tensor] = None  # For triple modulation (d_model)
     v_a: Optional[torch.Tensor] = None  # For single modulation
     v_b: Optional[torch.Tensor] = None  # For single modulation
     attention_output: Optional[torch.Tensor] = None
     modulation_magnitude: Optional[float] = None
+    modulation_type: str = "single"  # "single", "dual", or "triple"
     architecture_version: str = "new"  # Track architecture version
 
 
@@ -95,10 +175,15 @@ class SelectiveNPTLoader:
             # but the training objective differs. We assume checkpoints
             # from multi-training branch use new architecture
             if hasattr(layer, 'np_component'):
-                # Check for dual modulation (strong indicator of new architecture)
                 np_comp = layer.np_component
-                if hasattr(np_comp, 'dual_modulation') and np_comp.dual_modulation:
-                    return "new"
+
+                # Check for triple modulation (most advanced)
+                if hasattr(np_comp, 'triple_modulation') and np_comp.triple_modulation:
+                    log_info("Detected triple modulation configuration")
+                    return "new_triple"
+                # Check for dual modulation (strong indicator of new architecture)
+                elif hasattr(np_comp, 'dual_modulation') and np_comp.dual_modulation:
+                    return "new_dual"
                 # Single modulation could be either, default to new for recent checkpoints
                 return "new"
 
@@ -123,7 +208,7 @@ class SelectiveNPTLoader:
         Returns:
             model, tokenizer, available_npt_layers
         """
-        logger.info(f"Loading model with selective NPT layers: {layers_to_use}")
+        log_info(f"Loading model with selective NPT layers: {layers_to_use}")
         
         # Load base model configuration
         model_config = AutoConfig.from_pretrained(model_name)
@@ -139,7 +224,7 @@ class SelectiveNPTLoader:
         available_npt_layers = set()
         
         if npt_weights_path.exists():
-            logger.info(f"Loading NPT weights from {npt_weights_path}")
+            log_info(f"Loading NPT weights from {npt_weights_path}")
             
             # Load state dict to detect available layers
             state_dict = torch.load(npt_weights_path, map_location='cpu')
@@ -152,29 +237,45 @@ class SelectiveNPTLoader:
                         if part == 'layer' and i + 1 < len(parts) and parts[i + 1].isdigit():
                             available_npt_layers.add(int(parts[i + 1]))
             
-            logger.info(f"Available NPT layers in checkpoint: {sorted(available_npt_layers)}")
+            log_info(f"Available NPT layers in checkpoint: {sorted(available_npt_layers)}")
             
             # Determine which layers to actually convert
             layers_to_convert = [l for l in layers_to_use if l in available_npt_layers]
             
             if not layers_to_convert:
-                logger.warning(f"None of requested layers {layers_to_use} are available in checkpoint")
-                logger.warning(f"Available layers: {sorted(available_npt_layers)}")
+                log_warning(f"None of requested layers {layers_to_use} are available in checkpoint")
+                log_warning(f"Available layers: {sorted(available_npt_layers)}")
             else:
-                logger.info(f"Converting only layers {layers_to_convert} to NPT mode")
+                log_info(f"Converting only layers {layers_to_convert} to NPT mode")
                 
-                # Detect modulation type
-                dual_modulation = any('W_down_gate' in k for k in state_dict.keys())
-                
+                # Detect modulation type from checkpoint
+                # Check for any layer's weights to determine modulation type
+                all_keys = list(state_dict.keys())
+                dual_modulation = any('W_down_gate' in k or 'W_a_up_gate' in k or 'W_b_up_gate' in k for k in all_keys)
+                triple_modulation = any('W_down_down' in k or 'W_a_up_down' in k or 'W_b_up_down' in k for k in all_keys)
+
+                # Detect num_ranks from checkpoint structure
+                num_ranks = 1
+                # Look for indexed weights (e.g., W_down_gate.0, W_down_gate.1, etc.)
+                for i in range(16):  # Check up to 16 ranks
+                    if any(f'.{i}' in k and ('W_down_gate' in k or 'W_down_up' in k or 'W_down_down' in k) for k in all_keys):
+                        num_ranks = max(num_ranks, i + 1)
+                    else:
+                        if i > 0:  # Only break if we found at least rank 0
+                            break
+
+                log_info(f"Detected from checkpoint: dual={dual_modulation}, triple={triple_modulation}, num_ranks={num_ranks}")
+
                 # Create NPT config for ONLY the layers we want
                 npt_config = NPTConfig(
                     layers_to_convert=layers_to_convert,  # Only convert specified layers
                     np_rank=256,
                     np_init_scale=0.001,
                     single_layer_mode=False,
-                    num_ranks=4,
+                    num_ranks=num_ranks,
                     init_strategy="improved",
-                    dual_modulation=dual_modulation
+                    dual_modulation=dual_modulation,
+                    triple_modulation=triple_modulation
                 )
                 
                 # Convert only specified layers
@@ -200,13 +301,13 @@ class SelectiveNPTLoader:
                 
                 # Load the filtered weights
                 if filtered_state_dict:
-                    logger.info(f"Loading NPT weights for {len(layers_to_convert)} layers")
+                    log_info(f"Loading NPT weights for {len(layers_to_convert)} layers")
                     model.load_state_dict(filtered_state_dict, strict=False)
-                    logger.info(f"Successfully loaded NPT weights for layers: {layers_to_convert}")
+                    log_info(f"Successfully loaded NPT weights for layers: {layers_to_convert}")
                 else:
-                    logger.warning("No weights loaded - check layer indices")
+                    log_warning("No weights loaded - check layer indices")
         else:
-            logger.error(f"NPT weights not found at {npt_weights_path}")
+            log_error(f"NPT weights not found at {npt_weights_path}")
         
         # Move model to device
         model = model.to(device)
@@ -220,14 +321,21 @@ class SelectiveNPTLoader:
         # Verify architecture version
         active_layers = set(layers_to_convert) if 'layers_to_convert' in locals() else set()
         arch_version = SelectiveNPTLoader.verify_architecture_version(model, active_layers)
-        logger.info(f"Detected architecture version: {arch_version.upper()}")
+        log_info(f"Detected architecture version: {arch_version.upper()}")
 
-        if arch_version == "new":
-            logger.info("Using NEW architecture: MLP(h) → attention + MLP(h+attention)")
-            logger.info("Modulations encode both attention patterns and MLP transformations")
+        if arch_version == "new_triple":
+            log_info("Using NEW TRIPLE MODULATION architecture: MLP(h) → attention + MLP(h+attention)")
+            log_info("Triple modulation: Gate, Up, and Down projections all modulated")
+            log_info("Complete control over all MLP transformations")
+        elif arch_version == "new_dual":
+            log_info("Using NEW DUAL MODULATION architecture: MLP(h) → attention + MLP(h+attention)")
+            log_info("Dual modulation: Gate and Up projections modulated")
+        elif arch_version == "new":
+            log_info("Using NEW architecture: MLP(h) → attention + MLP(h+attention)")
+            log_info("Modulations encode both attention patterns and MLP transformations")
         elif arch_version == "old":
-            logger.warning("Using OLD architecture: MLP(h+attention) → MLP(h+attention)")
-            logger.warning("Results may differ from expected behavior")
+            log_warning("Using OLD architecture: MLP(h+attention) → MLP(h+attention)")
+            log_warning("Results may differ from expected behavior")
 
         # Return model with info about which layers are NPT
         return model, tokenizer, active_layers
@@ -268,7 +376,7 @@ class SelectiveModulationExtractor:
             layers_to_extract = [l for l in layers_to_extract if l in self.active_npt_layers]
 
         if not layers_to_extract:
-            logger.warning("No active NPT layers to extract from")
+            log_warning("No active NPT layers to extract from")
             return {}
 
         # Tokenize prompt and target
@@ -278,9 +386,9 @@ class SelectiveModulationExtractor:
         # Concatenate to create the full sequence
         full_ids = torch.cat([prompt_ids, target_ids[:, :1]], dim=1)
 
-        logger.info(f"Extracting modulation when generating '{target_token}' after '{prompt}'")
-        logger.info(f"Active NPT layers: {sorted(self.active_npt_layers)}")
-        logger.info(f"Extracting from layers: {layers_to_extract}")
+        log_info(f"Extracting modulation when generating '{target_token}' after '{prompt}'")
+        log_info(f"Active NPT layers: {sorted(self.active_npt_layers)}")
+        log_info(f"Extracting from layers: {layers_to_extract}")
 
         modulations = {}
         hook_fired = {layer: False for layer in layers_to_extract}
@@ -289,46 +397,74 @@ class SelectiveModulationExtractor:
         # In NEW architecture, this captures how MLP(h) at this position
         # produces attention + MLP(h+attention) to generate the next token
         target_position = prompt_ids.shape[1] - 1
-        logger.info(f"Extraction position: {target_position} (last token of prompt)")
-        logger.info(f"NEW Architecture: Extracting attention+MLP transformation")
+        log_info(f"Extraction position: {target_position} (last token of prompt)")
+        log_info(f"NEW Architecture: Extracting attention+MLP transformation")
         
         # Hook to capture modulations
         def create_hook(layer_idx):
             def hook(module, input, output):
-                if isinstance(output, tuple) and len(output) == 2:
+                if isinstance(output, tuple):
                     hook_fired[layer_idx] = True
-                    
-                    # Check if dual modulation
+
+                    # Check modulation type
                     if isinstance(output[0], tuple):
-                        # Dual modulation
-                        (v_a_gate, v_b_gate), (v_a_up, v_b_up) = output
-                        
-                        extracted_data = ModulationData(
-                            layer_idx=layer_idx,
-                            token_position=target_position,
-                            prompt=prompt,
-                            next_token=target_token,
-                            v_a_gate=v_a_gate[:, target_position:target_position+1].clone(),
-                            v_b_gate=v_b_gate[:, target_position:target_position+1].clone(),
-                            v_a_up=v_a_up[:, target_position:target_position+1].clone(),
-                            v_b_up=v_b_up[:, target_position:target_position+1].clone(),
-                            attention_output=input[0][:, target_position:target_position+1].clone()
-                        )
-                        
-                        # Calculate modulation magnitude
-                        # In NEW architecture, this represents the strength of
-                        # the attention+MLP transformation encoding
-                        magnitude = (
-                            v_a_gate.norm().item() + v_b_gate.norm().item() +
-                            v_a_up.norm().item() + v_b_up.norm().item()
-                        ) / 4
-                        extracted_data.modulation_magnitude = magnitude
-                        extracted_data.architecture_version = "new"
-                        
+                        # Check if triple modulation (3 tuples) or dual (2 tuples)
+                        if len(output) == 3:
+                            # Triple modulation
+                            (v_a_gate, v_b_gate), (v_a_up, v_b_up), (v_a_down, v_b_down) = output
+
+                            extracted_data = ModulationData(
+                                layer_idx=layer_idx,
+                                token_position=target_position,
+                                prompt=prompt,
+                                next_token=target_token,
+                                v_a_gate=v_a_gate[:, target_position:target_position+1].clone(),
+                                v_b_gate=v_b_gate[:, target_position:target_position+1].clone(),
+                                v_a_up=v_a_up[:, target_position:target_position+1].clone(),
+                                v_b_up=v_b_up[:, target_position:target_position+1].clone(),
+                                v_a_down=v_a_down[:, target_position:target_position+1].clone(),
+                                v_b_down=v_b_down[:, target_position:target_position+1].clone(),
+                                attention_output=input[0][:, target_position:target_position+1].clone(),
+                                modulation_type="triple"
+                            )
+
+                            # Calculate modulation magnitude including down modulation
+                            magnitude = (
+                                v_a_gate.norm().item() + v_b_gate.norm().item() +
+                                v_a_up.norm().item() + v_b_up.norm().item() +
+                                v_a_down.norm().item() + v_b_down.norm().item()
+                            ) / 6
+                            extracted_data.modulation_magnitude = magnitude
+                            extracted_data.architecture_version = "new_triple"
+
+                        else:
+                            # Dual modulation (2 tuples)
+                            (v_a_gate, v_b_gate), (v_a_up, v_b_up) = output
+
+                            extracted_data = ModulationData(
+                                layer_idx=layer_idx,
+                                token_position=target_position,
+                                prompt=prompt,
+                                next_token=target_token,
+                                v_a_gate=v_a_gate[:, target_position:target_position+1].clone(),
+                                v_b_gate=v_b_gate[:, target_position:target_position+1].clone(),
+                                v_a_up=v_a_up[:, target_position:target_position+1].clone(),
+                                v_b_up=v_b_up[:, target_position:target_position+1].clone(),
+                                attention_output=input[0][:, target_position:target_position+1].clone(),
+                                modulation_type="dual"
+                            )
+
+                            # Calculate modulation magnitude
+                            magnitude = (
+                                v_a_gate.norm().item() + v_b_gate.norm().item() +
+                                v_a_up.norm().item() + v_b_up.norm().item()
+                            ) / 4
+                            extracted_data.modulation_magnitude = magnitude
+                            extracted_data.architecture_version = "new_dual"
                     else:
                         # Single modulation
                         v_a, v_b = output
-                        
+
                         extracted_data = ModulationData(
                             layer_idx=layer_idx,
                             token_position=target_position,
@@ -336,14 +472,16 @@ class SelectiveModulationExtractor:
                             next_token=target_token,
                             v_a=v_a[:, target_position:target_position+1].clone(),
                             v_b=v_b[:, target_position:target_position+1].clone(),
-                            attention_output=input[0][:, target_position:target_position+1].clone()
+                            attention_output=input[0][:, target_position:target_position+1].clone(),
+                            modulation_type="single"
                         )
-                        
+
                         magnitude = (v_a.norm().item() + v_b.norm().item()) / 2
                         extracted_data.modulation_magnitude = magnitude
-                    
+                        extracted_data.architecture_version = "new"
+
                     modulations[layer_idx] = extracted_data
-                    
+
             return hook
         
         # Register hooks only on active NPT layers
@@ -371,7 +509,7 @@ class SelectiveModulationExtractor:
         # Log which hooks fired
         for layer_idx, fired in hook_fired.items():
             if not fired:
-                logger.warning(f"Hook did not fire for layer {layer_idx}")
+                log_warning(f"Hook did not fire for layer {layer_idx}")
             
         return modulations
 
@@ -408,8 +546,8 @@ class SelectiveLogitComputer:
         # Position where we want to inject
         injection_position = input_ids.shape[1] - 1
         
-        logger.info(f"Computing logits with injection at position {injection_position}")
-        logger.info(f"Injecting into layers: {list(source_modulations.keys())}")
+        log_info(f"Computing logits with injection at position {injection_position}")
+        log_info(f"Injecting into layers: {list(source_modulations.keys())}")
         
         # Storage for debugging
         original_modulations = {}
@@ -420,67 +558,145 @@ class SelectiveLogitComputer:
         def create_injection_hook(layer_idx, source_mod):
             def hook(module, input, output):
                 hook_fired[layer_idx] = True
-                
-                if isinstance(output, tuple) and len(output) == 2:
+
+                if isinstance(output, tuple):
                     if isinstance(output[0], tuple):
-                        # Dual modulation
-                        (v_a_gate, v_b_gate), (v_a_up, v_b_up) = output
-                        
-                        # Store original
-                        original_modulations[layer_idx] = {
-                            'magnitude': (
-                                v_a_gate[:, injection_position].norm().item() +
-                                v_b_gate[:, injection_position].norm().item() +
-                                v_a_up[:, injection_position].norm().item() +
-                                v_b_up[:, injection_position].norm().item()
-                            ) / 4
-                        }
-                        
-                        # Create modified tensors
-                        v_a_gate_new = v_a_gate.clone()
-                        v_b_gate_new = v_b_gate.clone()
-                        v_a_up_new = v_a_up.clone()
-                        v_b_up_new = v_b_up.clone()
-                        
-                        # Apply injection - transferring attention+MLP transformation
-                        # This makes MLP(h) at this position behave as if it has
-                        # the source's attention pattern and MLP processing
-                        if injection_mode == "replace":
-                            v_a_gate_new[:, injection_position:injection_position+1] = source_mod.v_a_gate
-                            v_b_gate_new[:, injection_position:injection_position+1] = source_mod.v_b_gate
-                            v_a_up_new[:, injection_position:injection_position+1] = source_mod.v_a_up
-                            v_b_up_new[:, injection_position:injection_position+1] = source_mod.v_b_up
-                        elif injection_mode == "blend":
-                            v_a_gate_new[:, injection_position:injection_position+1] = (
-                                blend_alpha * source_mod.v_a_gate +
-                                (1 - blend_alpha) * v_a_gate[:, injection_position:injection_position+1]
-                            )
-                            v_b_gate_new[:, injection_position:injection_position+1] = (
-                                blend_alpha * source_mod.v_b_gate +
-                                (1 - blend_alpha) * v_b_gate[:, injection_position:injection_position+1]
-                            )
-                            v_a_up_new[:, injection_position:injection_position+1] = (
-                                blend_alpha * source_mod.v_a_up +
-                                (1 - blend_alpha) * v_a_up[:, injection_position:injection_position+1]
-                            )
-                            v_b_up_new[:, injection_position:injection_position+1] = (
-                                blend_alpha * source_mod.v_b_up +
-                                (1 - blend_alpha) * v_b_up[:, injection_position:injection_position+1]
-                            )
-                        
-                        # Store injected
-                        injected_modulations[layer_idx] = {
-                            'magnitude': (
-                                v_a_gate_new[:, injection_position].norm().item() +
-                                v_b_gate_new[:, injection_position].norm().item() +
-                                v_a_up_new[:, injection_position].norm().item() +
-                                v_b_up_new[:, injection_position].norm().item()
-                            ) / 4
-                        }
-                        
-                        return (v_a_gate_new, v_b_gate_new), (v_a_up_new, v_b_up_new)
+                        # Check if triple modulation (3 tuples) or dual (2 tuples)
+                        if len(output) == 3 and source_mod.modulation_type == "triple":
+                            # Triple modulation - handle all three projections
+                            (v_a_gate, v_b_gate), (v_a_up, v_b_up), (v_a_down, v_b_down) = output
+
+                            # Store original magnitude
+                            original_modulations[layer_idx] = {
+                                'magnitude': (
+                                    v_a_gate[:, injection_position].norm().item() +
+                                    v_b_gate[:, injection_position].norm().item() +
+                                    v_a_up[:, injection_position].norm().item() +
+                                    v_b_up[:, injection_position].norm().item() +
+                                    v_a_down[:, injection_position].norm().item() +
+                                    v_b_down[:, injection_position].norm().item()
+                                ) / 6
+                            }
+
+                            # Create modified tensors
+                            v_a_gate_new = v_a_gate.clone()
+                            v_b_gate_new = v_b_gate.clone()
+                            v_a_up_new = v_a_up.clone()
+                            v_b_up_new = v_b_up.clone()
+                            v_a_down_new = v_a_down.clone()
+                            v_b_down_new = v_b_down.clone()
+
+                            # Apply injection - transferring all three modulations
+                            # This includes complete MLP control (gate, up, down)
+                            if injection_mode == "replace":
+                                v_a_gate_new[:, injection_position:injection_position+1] = source_mod.v_a_gate
+                                v_b_gate_new[:, injection_position:injection_position+1] = source_mod.v_b_gate
+                                v_a_up_new[:, injection_position:injection_position+1] = source_mod.v_a_up
+                                v_b_up_new[:, injection_position:injection_position+1] = source_mod.v_b_up
+                                v_a_down_new[:, injection_position:injection_position+1] = source_mod.v_a_down
+                                v_b_down_new[:, injection_position:injection_position+1] = source_mod.v_b_down
+                            elif injection_mode == "blend":
+                                v_a_gate_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_a_gate +
+                                    (1 - blend_alpha) * v_a_gate[:, injection_position:injection_position+1]
+                                )
+                                v_b_gate_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_b_gate +
+                                    (1 - blend_alpha) * v_b_gate[:, injection_position:injection_position+1]
+                                )
+                                v_a_up_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_a_up +
+                                    (1 - blend_alpha) * v_a_up[:, injection_position:injection_position+1]
+                                )
+                                v_b_up_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_b_up +
+                                    (1 - blend_alpha) * v_b_up[:, injection_position:injection_position+1]
+                                )
+                                v_a_down_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_a_down +
+                                    (1 - blend_alpha) * v_a_down[:, injection_position:injection_position+1]
+                                )
+                                v_b_down_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_b_down +
+                                    (1 - blend_alpha) * v_b_down[:, injection_position:injection_position+1]
+                                )
+
+                            # Store injected magnitude
+                            injected_modulations[layer_idx] = {
+                                'magnitude': (
+                                    v_a_gate_new[:, injection_position].norm().item() +
+                                    v_b_gate_new[:, injection_position].norm().item() +
+                                    v_a_up_new[:, injection_position].norm().item() +
+                                    v_b_up_new[:, injection_position].norm().item() +
+                                    v_a_down_new[:, injection_position].norm().item() +
+                                    v_b_down_new[:, injection_position].norm().item()
+                                ) / 6
+                            }
+
+                            return (v_a_gate_new, v_b_gate_new), (v_a_up_new, v_b_up_new), (v_a_down_new, v_b_down_new)
+
+                        elif len(output) == 2 or source_mod.modulation_type == "dual":
+                            # Dual modulation - handle gate and up
+                            (v_a_gate, v_b_gate), (v_a_up, v_b_up) = output[:2]
+
+                            # Store original
+                            original_modulations[layer_idx] = {
+                                'magnitude': (
+                                    v_a_gate[:, injection_position].norm().item() +
+                                    v_b_gate[:, injection_position].norm().item() +
+                                    v_a_up[:, injection_position].norm().item() +
+                                    v_b_up[:, injection_position].norm().item()
+                                ) / 4
+                            }
+
+                            # Create modified tensors
+                            v_a_gate_new = v_a_gate.clone()
+                            v_b_gate_new = v_b_gate.clone()
+                            v_a_up_new = v_a_up.clone()
+                            v_b_up_new = v_b_up.clone()
+
+                            # Apply injection
+                            if injection_mode == "replace":
+                                v_a_gate_new[:, injection_position:injection_position+1] = source_mod.v_a_gate
+                                v_b_gate_new[:, injection_position:injection_position+1] = source_mod.v_b_gate
+                                v_a_up_new[:, injection_position:injection_position+1] = source_mod.v_a_up
+                                v_b_up_new[:, injection_position:injection_position+1] = source_mod.v_b_up
+                            elif injection_mode == "blend":
+                                v_a_gate_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_a_gate +
+                                    (1 - blend_alpha) * v_a_gate[:, injection_position:injection_position+1]
+                                )
+                                v_b_gate_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_b_gate +
+                                    (1 - blend_alpha) * v_b_gate[:, injection_position:injection_position+1]
+                                )
+                                v_a_up_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_a_up +
+                                    (1 - blend_alpha) * v_a_up[:, injection_position:injection_position+1]
+                                )
+                                v_b_up_new[:, injection_position:injection_position+1] = (
+                                    blend_alpha * source_mod.v_b_up +
+                                    (1 - blend_alpha) * v_b_up[:, injection_position:injection_position+1]
+                                )
+
+                            # Store injected
+                            injected_modulations[layer_idx] = {
+                                'magnitude': (
+                                    v_a_gate_new[:, injection_position].norm().item() +
+                                    v_b_gate_new[:, injection_position].norm().item() +
+                                    v_a_up_new[:, injection_position].norm().item() +
+                                    v_b_up_new[:, injection_position].norm().item()
+                                ) / 4
+                            }
+
+                            # Return appropriate format
+                            if len(output) == 3:
+                                # Model expects triple, but we're only injecting dual
+                                return (v_a_gate_new, v_b_gate_new), (v_a_up_new, v_b_up_new), output[2]
+                            else:
+                                return (v_a_gate_new, v_b_gate_new), (v_a_up_new, v_b_up_new)
                     else:
-                        # Single modulation (similar logic)
+                        # Single modulation (original logic)
                         v_a, v_b = output
                         
                         original_modulations[layer_idx] = {
@@ -599,13 +815,13 @@ class SelectiveFactualTransferAnalyzer:
         NEW Architecture: Transfers both attention patterns and MLP transformations
         from source to target context, enabling richer knowledge transfer.
         """
-        logger.info("\n" + "="*80)
-        logger.info("NEW ARCHITECTURE: MLP(h) → attention + MLP(h+attention)")
-        logger.info(f"Source: '{source_prompt}' -> '{source_answer}'")
-        logger.info(f"Target: '{target_prompt}' -> '{target_answer}'")
-        logger.info(f"Active NPT layers: {sorted(self.active_npt_layers)}")
-        logger.info("Transferring attention patterns + MLP transformations")
-        logger.info("="*80)
+        log_info("\n" + "="*80)
+        log_info("NEW ARCHITECTURE: MLP(h) → attention + MLP(h+attention)")
+        log_info(f"Source: '{source_prompt}' -> '{source_answer}'")
+        log_info(f"Target: '{target_prompt}' -> '{target_answer}'")
+        log_info(f"Active NPT layers: {sorted(self.active_npt_layers)}")
+        log_info("Transferring attention patterns + MLP transformations")
+        log_info("="*80)
 
         results = {
             'source_prompt': source_prompt,
@@ -617,17 +833,17 @@ class SelectiveFactualTransferAnalyzer:
         }
 
         # Extract modulations from source
-        logger.info("\n1. Extracting source modulations (attention + MLP transformation)...")
+        log_info("\n1. Extracting source modulations (attention + MLP transformation)...")
         source_modulations = self.extractor.extract_generation_modulation(
             prompt=source_prompt,
             target_token=source_answer
         )
 
         for layer_idx, mod_data in source_modulations.items():
-            logger.info(f"  Layer {layer_idx}: Magnitude = {mod_data.modulation_magnitude:.6f}")
+            log_info(f"  Layer {layer_idx}: Magnitude = {mod_data.modulation_magnitude:.6f}")
 
         # Get baseline probabilities
-        logger.info("\n2. Computing baseline probabilities...")
+        log_info("\n2. Computing baseline probabilities...")
         baseline = self.logit_computer.compute_baseline_logits(target_prompt)
 
         # Get top predictions
@@ -639,19 +855,19 @@ class SelectiveFactualTransferAnalyzer:
         source_token_id = self.tokenizer(source_answer, add_special_tokens=False).input_ids[0]
         target_token_id = self.tokenizer(target_answer, add_special_tokens=False).input_ids[0]
 
-        logger.info(f"  Top-5 baseline: {baseline_top_tokens[:5]}")
-        logger.info(f"  {source_answer} baseline prob: {baseline['probs'][source_token_id]:.6f}")
-        logger.info(f"  {target_answer} baseline prob: {baseline['probs'][target_token_id]:.6f}")
+        log_info(f"  Top-5 baseline: {baseline_top_tokens[:5]}")
+        log_info(f"  {source_answer} baseline prob: {baseline['probs'][source_token_id]:.6f}")
+        log_info(f"  {target_answer} baseline prob: {baseline['probs'][target_token_id]:.6f}")
 
         # Test each layer
-        logger.info("\n3. Testing modulation injection...")
+        log_info("\n3. Testing modulation injection...")
 
         for layer_idx in sorted(self.active_npt_layers):
             if layer_idx not in source_modulations:
-                logger.warning(f"  Layer {layer_idx}: No modulation available")
+                log_warning(f"  Layer {layer_idx}: No modulation available")
                 continue
 
-            logger.info(f"\n  Layer {layer_idx}:")
+            log_info(f"\n  Layer {layer_idx}:")
 
             # Inject and compute
             injection_result = self.logit_computer.compute_logits_with_injection(
@@ -682,12 +898,12 @@ class SelectiveFactualTransferAnalyzer:
             top_k_changes = len(baseline_top_set - injected_top_set)
 
             # Log results - modulation magnitude represents attention+MLP strength
-            logger.info(f"    Modulation magnitude (attn+MLP): {injection_result['original_modulations'][layer_idx]['magnitude']:.6f} -> {injection_result['injected_modulations'][layer_idx]['magnitude']:.6f}")
-            logger.info(f"    {source_answer}: {source_prob_before:.6f} -> {source_prob_after:.6f} (shift: {source_prob_after - source_prob_before:+.6f}, {(source_prob_after - source_prob_before) / (source_prob_before + 1e-10) * 100:+.1f}%)")
-            logger.info(f"    {target_answer}: {target_prob_before:.6f} -> {target_prob_after:.6f} (shift: {target_prob_after - target_prob_before:+.6f}, {(target_prob_after - target_prob_before) / (target_prob_before + 1e-10) * 100:+.1f}%)")
-            logger.info(f"    KL divergence: {kl_div:.6f}")
-            logger.info(f"    Top-10 changes: {top_k_changes}/10")
-            logger.info(f"    New top-3: {injected_top_tokens[:3]}")
+            log_info(f"    Modulation magnitude (attn+MLP): {injection_result['original_modulations'][layer_idx]['magnitude']:.6f} -> {injection_result['injected_modulations'][layer_idx]['magnitude']:.6f}")
+            log_info(f"    {source_answer}: {source_prob_before:.6f} -> {source_prob_after:.6f} (shift: {source_prob_after - source_prob_before:+.6f}, {(source_prob_after - source_prob_before) / (source_prob_before + 1e-10) * 100:+.1f}%)")
+            log_info(f"    {target_answer}: {target_prob_before:.6f} -> {target_prob_after:.6f} (shift: {target_prob_after - target_prob_before:+.6f}, {(target_prob_after - target_prob_before) / (target_prob_before + 1e-10) * 100:+.1f}%)")
+            log_info(f"    KL divergence: {kl_div:.6f}")
+            log_info(f"    Top-10 changes: {top_k_changes}/10")
+            log_info(f"    New top-3: {injected_top_tokens[:3]}")
 
             # Store results
             results['layer_results'][layer_idx] = {
@@ -707,8 +923,8 @@ class SelectiveFactualTransferAnalyzer:
 
         # TEST CUMULATIVE EFFECT: Inject ALL layers together
         if len(self.active_npt_layers) > 1:
-            logger.info("\n4. Testing CUMULATIVE injection (all layers together)...")
-            logger.info(f"   Injecting into layers: {sorted(self.active_npt_layers)}")
+            log_info("\n4. Testing CUMULATIVE injection (all layers together)...")
+            log_info(f"   Injecting into layers: {sorted(self.active_npt_layers)}")
 
             # Inject into ALL active layers simultaneously
             cumulative_result = self.logit_computer.compute_logits_with_injection(
@@ -737,31 +953,31 @@ class SelectiveFactualTransferAnalyzer:
             cumulative_top_k_changes = len(baseline_top_set - cumulative_top_set)
 
             # Log cumulative results
-            logger.info(f"\n  CUMULATIVE EFFECT (All layers {sorted(self.active_npt_layers)}):")
-            logger.info(f"    {source_answer}: {source_prob_before:.6f} -> {source_prob_cumulative:.6f} (shift: {source_prob_cumulative - source_prob_before:+.6f}, {(source_prob_cumulative - source_prob_before) / (source_prob_before + 1e-10) * 100:+.1f}%)")
-            logger.info(f"    {target_answer}: {target_prob_before:.6f} -> {target_prob_cumulative:.6f} (shift: {target_prob_cumulative - target_prob_before:+.6f}, {(target_prob_cumulative - target_prob_before) / (target_prob_before + 1e-10) * 100:+.1f}%)")
-            logger.info(f"    KL divergence: {kl_div_cumulative:.6f}")
-            logger.info(f"    Top-10 changes: {cumulative_top_k_changes}/10")
-            logger.info(f"    New top-3: {cumulative_top_tokens[:3]}")
+            log_info(f"\n  CUMULATIVE EFFECT (All layers {sorted(self.active_npt_layers)}):")
+            log_info(f"    {source_answer}: {source_prob_before:.6f} -> {source_prob_cumulative:.6f} (shift: {source_prob_cumulative - source_prob_before:+.6f}, {(source_prob_cumulative - source_prob_before) / (source_prob_before + 1e-10) * 100:+.1f}%)")
+            log_info(f"    {target_answer}: {target_prob_before:.6f} -> {target_prob_cumulative:.6f} (shift: {target_prob_cumulative - target_prob_before:+.6f}, {(target_prob_cumulative - target_prob_before) / (target_prob_before + 1e-10) * 100:+.1f}%)")
+            log_info(f"    KL divergence: {kl_div_cumulative:.6f}")
+            log_info(f"    Top-10 changes: {cumulative_top_k_changes}/10")
+            log_info(f"    New top-3: {cumulative_top_tokens[:3]}")
 
             # Compare to individual effects
-            logger.info(f"\n    Comparison:")
+            log_info(f"\n    Comparison:")
             total_individual_shift = sum(
                 results['layer_results'][idx]['source_shift']
                 for idx in self.active_npt_layers
                 if idx in results['layer_results']
             )
-            logger.info(f"    Sum of individual shifts: {total_individual_shift:+.6f}")
-            logger.info(f"    Actual cumulative shift:  {source_prob_cumulative - source_prob_before:+.6f}")
+            log_info(f"    Sum of individual shifts: {total_individual_shift:+.6f}")
+            log_info(f"    Actual cumulative shift:  {source_prob_cumulative - source_prob_before:+.6f}")
 
             synergy = (source_prob_cumulative - source_prob_before) - total_individual_shift
             if abs(synergy) > 0.001:
                 if synergy > 0:
-                    logger.info(f"    SYNERGY: Cumulative effect is {synergy:+.6f} STRONGER than sum of parts!")
+                    log_info(f"    SYNERGY: Cumulative effect is {synergy:+.6f} STRONGER than sum of parts!")
                 else:
-                    logger.info(f"    INTERFERENCE: Cumulative effect is {abs(synergy):.6f} WEAKER than sum of parts")
+                    log_info(f"    INTERFERENCE: Cumulative effect is {abs(synergy):.6f} WEAKER than sum of parts")
             else:
-                logger.info(f"    Effects are approximately additive")
+                log_info(f"    Effects are approximately additive")
 
             # Store cumulative results
             results['cumulative_effect'] = {
@@ -784,12 +1000,12 @@ class SelectiveFactualTransferAnalyzer:
 
     def verify_model_quality(self, test_prompts: List[str]):
         """Verify that the model with selective NPT produces reasonable outputs."""
-        logger.info("\n" + "="*80)
-        logger.info("Verifying Model Quality with Selective NPT")
-        logger.info("="*80)
+        log_info("\n" + "="*80)
+        log_info("Verifying Model Quality with Selective NPT")
+        log_info("="*80)
 
         for prompt in test_prompts:
-            logger.info(f"\nPrompt: '{prompt}'")
+            log_info(f"\nPrompt: '{prompt}'")
 
             # Get predictions
             baseline = self.logit_computer.compute_baseline_logits(prompt)
@@ -798,9 +1014,60 @@ class SelectiveFactualTransferAnalyzer:
             top_5_probs, top_5_indices = torch.topk(baseline['probs'], 5)
             top_5_tokens = [self.tokenizer.decode([idx]) for idx in top_5_indices]
 
-            logger.info("  Top-5 predictions:")
+            log_info("  Top-5 predictions:")
             for token, prob in zip(top_5_tokens, top_5_probs):
-                logger.info(f"    '{token}': {prob:.4f}")
+                log_info(f"    '{token}': {prob:.4f}")
+
+
+def save_summary(output_dir: Path, all_results: List[Dict], active_layers: Set[int], args):
+    """Save a comprehensive summary of results."""
+    summary = {
+        "metadata": {
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            "checkpoint": str(args.checkpoint),
+            "model": args.model_name,
+            "active_npt_layers": sorted(list(active_layers)),
+            "device": args.device,
+            "use_context": args.use_context
+        },
+        "experiments": all_results,
+        "summary_statistics": {}
+    }
+
+    # Calculate summary statistics
+    if all_results:
+        # Average shifts across experiments
+        avg_source_shift = np.mean([
+            r.get('cumulative_effect', r.get('layer_results', {}).get(list(active_layers)[0], {})).get('source_shift', 0)
+            for r in all_results if r
+        ])
+        avg_target_shift = np.mean([
+            r.get('cumulative_effect', r.get('layer_results', {}).get(list(active_layers)[0], {})).get('target_shift', 0)
+            for r in all_results if r
+        ])
+
+        summary["summary_statistics"] = {
+            "average_source_shift": float(avg_source_shift),
+            "average_target_shift": float(avg_target_shift),
+            "total_experiments": len(all_results),
+            "successful_transfers": sum(1 for r in all_results if r.get('cumulative_effect', {}).get('source_shift', 0) > 0.01)
+        }
+
+    # Save JSON summary
+    summary_path = output_dir / "transfer_summary.json"
+    with open(summary_path, 'w') as f:
+        json.dump(summary, f, indent=2, default=str)
+
+    dual_logger.info(f"\nSummary saved to: {summary_path}")
+    dual_logger.info("\n" + "=" * 80)
+    dual_logger.info("FINAL SUMMARY")
+    dual_logger.info("=" * 80)
+    dual_logger.info(f"Total experiments: {summary['summary_statistics'].get('total_experiments', 0)}")
+    dual_logger.info(f"Successful transfers: {summary['summary_statistics'].get('successful_transfers', 0)}")
+    dual_logger.info(f"Average source shift: {summary['summary_statistics'].get('average_source_shift', 0):.6f}")
+    dual_logger.info(f"Average target shift: {summary['summary_statistics'].get('average_target_shift', 0):.6f}")
+
+    return summary
 
 
 def main():
@@ -812,8 +1079,33 @@ def main():
     parser.add_argument("--verify_quality", action="store_true", help="Verify model quality")
     parser.add_argument("--output_dir", type=str, default="experiments/factual_transfer_selective")
     parser.add_argument("--use_context", action="store_true", help="Use contextual prompts for stronger association")
+    parser.add_argument("--log_file", type=str, help="Path to save log file (optional)")
 
     args = parser.parse_args()
+
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Setup dual logger
+    global dual_logger
+    log_file_path = None
+
+    if args.log_file:
+        log_file_path = Path(args.log_file)
+    else:
+        # Auto-generate log file name based on timestamp
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        log_file_path = output_dir / f"transfer_log_{timestamp}.txt"
+
+    global dual_logger
+    dual_logger = DualLogger(log_file_path)
+    dual_logger.info(f"Knowledge Transfer Experiment Log")
+    dual_logger.info(f"Checkpoint: {args.checkpoint}")
+    dual_logger.info(f"Model: {args.model_name}")
+    dual_logger.info(f"Layers: {args.layers}")
+    dual_logger.info(f"Output directory: {output_dir}")
+    dual_logger.info("")
 
     # Set seed
     torch.manual_seed(42)
@@ -832,7 +1124,8 @@ def main():
     )
 
     if not active_npt_layers:
-        logger.error("No NPT layers loaded. Exiting.")
+        dual_logger.error("No NPT layers loaded. Exiting.")
+        dual_logger.close()
         return
 
     # Create analyzer
@@ -873,7 +1166,7 @@ def main():
                 'target_answer': " Oliver"
             }
         ]
-        logger.info("\n=== Using CONTEXTUAL prompts for stronger association ===")
+        log_info("\n=== Using CONTEXTUAL prompts for stronger association ===")
     else:
         # Original simple prompts
         experiments = [
@@ -910,55 +1203,15 @@ def main():
         )
         all_results.append(results)
 
-    # Save results
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    # Save comprehensive summary and results
+    summary = save_summary(output_dir, all_results, active_npt_layers, args)
 
-    with open(output_dir / 'results.json', 'w') as f:
-        json.dump(all_results, f, indent=2, default=str)
+    # Close dual logger
+    dual_logger.info(f"\nAll results saved to: {output_dir}")
+    dual_logger.info(f"Log file: {log_file_path}")
+    dual_logger.close()
 
-    logger.info(f"\nResults saved to {output_dir}")
-
-    # Print summary
-    logger.info("\n" + "="*80)
-    logger.info("SUMMARY")
-    logger.info("="*80)
-
-    for exp_idx, result in enumerate(all_results):
-        logger.info(f"\nExperiment {exp_idx + 1}: {result['source_prompt']} -> {result['target_prompt']}")
-        logger.info(f"Active NPT layers: {result['active_npt_layers']}")
-
-        # Individual layer effects
-        for layer_idx, layer_result in result['layer_results'].items():
-            source_shift = layer_result['source_shift']
-            target_shift = layer_result['target_shift']
-            logger.info(f"  Layer {layer_idx} (alone):")
-            logger.info(f"    Source ({result['source_answer']}): {source_shift:+.6f} ({layer_result['source_relative_shift']*100:+.1f}%)")
-            logger.info(f"    Target ({result['target_answer']}): {target_shift:+.6f} ({layer_result['target_relative_shift']*100:+.1f}%)")
-
-        # Cumulative effect
-        if 'cumulative_effect' in result:
-            cum = result['cumulative_effect']
-            logger.info(f"  CUMULATIVE (layers {cum['layers']}):")
-            logger.info(f"    Source ({result['source_answer']}): {cum['source_shift']:+.6f} ({cum['source_relative_shift']*100:+.1f}%)")
-            logger.info(f"    Target ({result['target_answer']}): {cum['target_shift']:+.6f} ({cum['target_relative_shift']*100:+.1f}%)")
-            if abs(cum.get('synergy', 0)) > 0.001:
-                if cum['synergy'] > 0:
-                    logger.info(f"    💥 SYNERGY: +{cum['synergy']:.6f} stronger than sum!")
-                else:
-                    logger.info(f"    ⚠️  INTERFERENCE: {cum['synergy']:.6f} weaker than sum")
-
-    # Explain what the results mean with NEW architecture
-    logger.info("\n" + "="*80)
-    logger.info("INTERPRETATION (NEW Architecture)")
-    logger.info("="*80)
-    logger.info("\nWith the NEW architecture where MLP(h) → attention + MLP(h+attention):")
-    logger.info("• Positive source shifts indicate successful transfer of attention patterns")
-    logger.info("• The modulation encodes BOTH how attention processes the context")
-    logger.info("  AND how the MLP transforms with that attention")
-    logger.info("• Stronger effects are expected because we're transferring richer representations")
-    logger.info("• Each injection makes the model 'experience' the source context at that position")
-
-
+    print(f"\n✓ Results saved to: {output_dir}")
+    print(f"✓ Log file: {log_file_path}")
 if __name__ == "__main__":
     main()
