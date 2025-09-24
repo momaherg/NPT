@@ -17,7 +17,7 @@ python scripts/train_multi_layer_npt.py \
   --layer_weights "uniform" \
   --init_strategy improved \
   --triple_modulation \
-  --num_ranks 8 \
+  --num_ranks 12 \
   --np_rank 1024 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
