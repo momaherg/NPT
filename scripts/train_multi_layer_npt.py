@@ -54,6 +54,7 @@ class CurriculumStage:
     name: str  # "teacher", "mixed", "student"
     until_step: int
     mixing_ratio: float = 0.0  # For attention input mixing (0=teacher, 1=student)
+    mlp_mixing_ratio: Optional[float] = None  # For MLP input mixing (defaults to mixing_ratio)
 
 
 class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
@@ -117,14 +118,22 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                 if self.current_stage != stage:
                     self.current_stage = stage
                     self.current_stage_index = i
-                    logger.info(f"Curriculum stage changed to: {stage.name} (mixing_ratio={stage.mixing_ratio})")
+
+                    # Log curriculum change with dual scaffolding info
+                    mlp_ratio = stage.mlp_mixing_ratio if stage.mlp_mixing_ratio is not None else stage.mixing_ratio
+                    logger.info(f"Curriculum stage changed to: {stage.name}")
+                    logger.info(f"  Attention mixing ratio: {stage.mixing_ratio} (0=teacher, 1=student)")
+                    logger.info(f"  MLP mixing ratio: {mlp_ratio} (0=teacher, 1=student)")
+                    if stage.mlp_mixing_ratio is not None and stage.mlp_mixing_ratio != stage.mixing_ratio:
+                        logger.info(f"  NOTE: Using separate MLP curriculum!")
 
                     # Log stage transition to WandB if available
                     if self.tracker:
                         self.tracker.log_metrics({
                             'curriculum/stage_index': i,
                             'curriculum/stage_transition': 1,  # Spike to mark transition
-                            'curriculum/mixing_ratio': stage.mixing_ratio,
+                            'curriculum/attention_mixing_ratio': stage.mixing_ratio,
+                            'curriculum/mlp_mixing_ratio': mlp_ratio,
                         }, step=self.global_step)
                 break
 
@@ -298,10 +307,24 @@ class MultiLayerNPTTrainer(SingleLayerNPTTrainer):
                     v_a_up = v_b_up = None
 
                 # NEW ARCHITECTURE: MLP_modulated(h) should output attention + MLP(h+attention)
-                # The residual is just hidden_states (h), no attention added
-                mlp_residual = hidden_states
+                # Apply teacher scaffolding to MLP input for consistent learning
 
-                # MLP gets normalized residual WITHOUT attention
+                # Determine MLP residual based on curriculum (DUAL SCAFFOLDING)
+                if self.current_stage.name == "teacher":
+                    # Use teacher's state for MLP during teacher phase
+                    mlp_residual = teacher_states[f"before_{i}"]
+                elif self.current_stage.name == "mixed":
+                    # Mix teacher and student states for MLP
+                    # Use separate MLP mixing ratio if provided, otherwise use attention ratio
+                    mlp_ratio = self.current_stage.mlp_mixing_ratio
+                    if mlp_ratio is None:
+                        mlp_ratio = self.current_stage.mixing_ratio
+                    mlp_residual = (1 - mlp_ratio) * teacher_states[f"before_{i}"] + mlp_ratio * hidden_states
+                else:  # "student"
+                    # Use student's propagated state
+                    mlp_residual = hidden_states
+
+                # MLP gets normalized residual (now curriculum-controlled)
                 mlp_input = layer.post_attention_layernorm(mlp_residual)
 
                 # Apply appropriate modulation
@@ -1168,8 +1191,10 @@ def parse_curriculum(curriculum_str):
     """
     Parse curriculum string into schedule.
 
-    Format: stage:steps[:mixing_ratio],stage:steps[:mixing_ratio],...
-    Example: "teacher:5000,mixed:5000:0.5,student:20000"
+    Format: stage:steps[:attn_ratio[:mlp_ratio]],stage:steps[:attn_ratio[:mlp_ratio]],...
+    Examples:
+        "teacher:5000,mixed:5000:0.5,student:20000"  # Same ratio for attention and MLP
+        "teacher:5000,mixed:5000:0.3:0.5,student:20000"  # Different ratios (attn transitions faster)
     """
     stages = []
     cumulative_steps = 0
@@ -1182,12 +1207,14 @@ def parse_curriculum(curriculum_str):
         stage_name = parts[0]
         steps = int(parts[1])
         mixing_ratio = float(parts[2]) if len(parts) > 2 else 0.0
+        mlp_mixing_ratio = float(parts[3]) if len(parts) > 3 else None  # Optional separate MLP ratio
 
         cumulative_steps += steps
         stages.append(CurriculumStage(
             name=stage_name,
             until_step=cumulative_steps,
-            mixing_ratio=mixing_ratio
+            mixing_ratio=mixing_ratio,
+            mlp_mixing_ratio=mlp_mixing_ratio
         ))
 
     return stages
@@ -1438,6 +1465,7 @@ def main():
     logger.info(f"  Current Step: {trainer.global_step}")
     logger.info(f"  Remaining Steps: {args.max_steps - trainer.global_step}")
     logger.info(f"  Curriculum: {[s.name for s in curriculum_schedule]}")
+    logger.info(f"  DUAL SCAFFOLDING: Enabled (both attention and MLP use teacher inputs)")
     if trainer.current_stage:
         logger.info(f"  Current Stage: {trainer.current_stage.name}")
     logger.info(f"  Gradient Scale Factor: {args.gradient_scale_factor}x")

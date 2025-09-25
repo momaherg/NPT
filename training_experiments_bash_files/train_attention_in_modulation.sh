@@ -17,11 +17,11 @@ python scripts/train_multi_layer_npt.py \
   --layer_weights "uniform" \
   --init_strategy improved \
   --triple_modulation \
-  --num_ranks 12 \
-  --np_rank 1024 \
+  --num_ranks 4 \
+  --np_rank 256 \
   --np_init_scale 0.001 \
   --dataset_preset medium \
-  --batch_size 32 \
+  --batch_size 64 \
   --gradient_accumulation_steps 1 \
   --max_length 32 \
   --learning_rate 5e-5 \
@@ -41,7 +41,7 @@ python scripts/train_multi_layer_npt.py \
   --generation_steps 500 \
   --num_workers 1 \
   --wandb_project npt-multi-layer \
-  --wandb_name npt_attention_in_triple_modulation_15layers \
+  --wandb_name npt_dualscaffholding_attention_in_triple_modulation_15layers \
   --wandb_tags llama-3.2 1b dual_modulation attention_in_modulation new_architecture 
   # --resume_from "experiments/npt_attention_in_triple_modulation_15layers/checkpoints/checkpoint-30000/"
 

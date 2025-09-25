@@ -227,6 +227,14 @@ class InteractiveKnowledgeTransfer:
   inject-add <name> "prompt" -strength X - Additive injection
   compare <name> "prompt"       - Compare baseline vs injection
 
+  {Colors.BOLD}Multi-Token Generation:{Colors.END}
+  inject[-mode] <name> "prompt" -tokens N   - Generate N tokens with injection
+    Additional options:
+    -temp T        - Temperature for sampling (default: 1.0)
+    -strategy S    - Sampling strategy: greedy, top_k, top_p (default: greedy)
+    -top_k K       - Top-K value for sampling (default: 50)
+    -top_p P       - Top-P value for nucleus sampling (default: 0.9)
+
 {Colors.CYAN}Layer Management:{Colors.END}
   layers                        - Show active NPT layers
   layers <l1,l2,...>           - Set active layers
@@ -246,6 +254,12 @@ class InteractiveKnowledgeTransfer:
   inject paris "The capital of Germany is"  # Inject modulation
   inject diff "The capital of Germany is"   # Inject difference
   compare paris "The capital of Germany is" # Compare results
+
+  # Multi-token generation examples:
+  extract context "Q: Who is Einstein? A: A famous physicist"
+  inject-add context "Q: Who is Maher? A:" -strength 2 -tokens 10
+  inject-blend facts "Explain:" -alpha 0.7 -tokens 20 -temp 0.8
+  inject knowledge "The answer is" -tokens 15 -strategy top_p -top_p 0.9
 """
         print(help_text)
 
@@ -598,7 +612,7 @@ class InteractiveKnowledgeTransfer:
     def cmd_inject(self, args: List[str], mode: str = 'replace'):
         """Inject modulation and test."""
         if len(args) < 2:
-            print(f"{Colors.RED}Usage: inject <name> \"prompt\" [-alpha X | -strength X]{Colors.END}")
+            print(f"{Colors.RED}Usage: inject <name> \"prompt\" [-alpha X | -strength X] [-tokens N] [-temp T] [-strategy S]{Colors.END}")
             return
 
         name = args[0]
@@ -611,46 +625,111 @@ class InteractiveKnowledgeTransfer:
         # Parse additional parameters
         alpha = 1.0
         strength = 1.0
-        if len(args) > 2:
-            if args[2] == '-alpha' and len(args) > 3:
+        num_tokens = 1
+        temperature = 1.0
+        sampling_strategy = "greedy"
+        top_k = 50
+        top_p = 0.9
+
+        # Parse all arguments
+        i = 2
+        while i < len(args):
+            if args[i] == '-alpha' and i + 1 < len(args):
                 try:
-                    alpha = float(args[3])
+                    alpha = float(args[i + 1])
+                    i += 2
                 except ValueError:
-                    print(f"{Colors.RED}Invalid alpha: {args[3]}{Colors.END}")
+                    print(f"{Colors.RED}Invalid alpha: {args[i + 1]}{Colors.END}")
                     return
-            elif args[2] == '-strength' and len(args) > 3:
+            elif args[i] == '-strength' and i + 1 < len(args):
                 try:
-                    strength = float(args[3])
+                    strength = float(args[i + 1])
+                    i += 2
                 except ValueError:
-                    print(f"{Colors.RED}Invalid strength: {args[3]}{Colors.END}")
+                    print(f"{Colors.RED}Invalid strength: {args[i + 1]}{Colors.END}")
                     return
+            elif args[i] == '-tokens' and i + 1 < len(args):
+                try:
+                    num_tokens = int(args[i + 1])
+                    if num_tokens < 1:
+                        print(f"{Colors.RED}Number of tokens must be >= 1{Colors.END}")
+                        return
+                    i += 2
+                except ValueError:
+                    print(f"{Colors.RED}Invalid number of tokens: {args[i + 1]}{Colors.END}")
+                    return
+            elif args[i] == '-temp' and i + 1 < len(args):
+                try:
+                    temperature = float(args[i + 1])
+                    if temperature <= 0:
+                        print(f"{Colors.RED}Temperature must be > 0{Colors.END}")
+                        return
+                    i += 2
+                except ValueError:
+                    print(f"{Colors.RED}Invalid temperature: {args[i + 1]}{Colors.END}")
+                    return
+            elif args[i] == '-strategy' and i + 1 < len(args):
+                strategy = args[i + 1].lower()
+                if strategy not in ["greedy", "top_k", "top_p", "sample"]:
+                    print(f"{Colors.RED}Invalid strategy: {args[i + 1]}. Use: greedy, top_k, top_p, or sample{Colors.END}")
+                    return
+                sampling_strategy = "top_k" if strategy == "sample" else strategy
+                i += 2
+            elif args[i] == '-top_k' and i + 1 < len(args):
+                try:
+                    top_k = int(args[i + 1])
+                    i += 2
+                except ValueError:
+                    print(f"{Colors.RED}Invalid top_k: {args[i + 1]}{Colors.END}")
+                    return
+            elif args[i] == '-top_p' and i + 1 < len(args):
+                try:
+                    top_p = float(args[i + 1])
+                    i += 2
+                except ValueError:
+                    print(f"{Colors.RED}Invalid top_p: {args[i + 1]}{Colors.END}")
+                    return
+            else:
+                print(f"{Colors.YELLOW}Unknown parameter: {args[i]}{Colors.END}")
+                i += 1
 
-        print(f"\n{Colors.BOLD}Testing with injection{Colors.END}")
-        print(f"Prompt: \"{Colors.CYAN}{prompt}{Colors.END}\"")
-        print(f"Injecting: {Colors.YELLOW}{name}{Colors.END} (mode: {mode}")
-        if mode == 'blend':
-            print(f", alpha={alpha}")
-        elif mode == 'add':
-            print(f", strength={strength}")
-        print(")\n")
-
-        # Get modulation to inject
-        modulations_to_inject = self.session.modulation_bank[name]
-
-        # Compute logits with injection
+        # Prepare injection config
         injection_config = {
             'mode': mode,
             'alpha': alpha,
             'strength': strength
         }
-        logits, probs = self._compute_logits(prompt, modulations_to_inject, injection_config)
 
-        # Display results with comparison to baseline
-        baseline_probs = None
-        if self.session.last_prompt == prompt and self.session.last_baseline_probs is not None:
-            baseline_probs = self.session.last_baseline_probs
+        # Check if multi-token generation
+        if num_tokens > 1:
+            # Use multi-token generation
+            self._generate_with_injection(
+                name, prompt, mode, num_tokens, injection_config,
+                sampling_strategy, temperature, top_k, top_p
+            )
+        else:
+            # Single token prediction (existing behavior)
+            print(f"\n{Colors.BOLD}Testing with injection{Colors.END}")
+            print(f"Prompt: \"{Colors.CYAN}{prompt}{Colors.END}\"")
+            print(f"Injecting: {Colors.YELLOW}{name}{Colors.END} (mode: {mode}")
+            if mode == 'blend':
+                print(f", alpha={alpha}")
+            elif mode == 'add':
+                print(f", strength={strength}")
+            print(")\n")
 
-        self._display_predictions(probs, baseline_probs)
+            # Get modulation to inject
+            modulations_to_inject = self.session.modulation_bank[name]
+
+            # Compute logits with injection
+            logits, probs = self._compute_logits(prompt, modulations_to_inject, injection_config)
+
+            # Display results with comparison to baseline
+            baseline_probs = None
+            if self.session.last_prompt == prompt and self.session.last_baseline_probs is not None:
+                baseline_probs = self.session.last_baseline_probs
+
+            self._display_predictions(probs, baseline_probs)
 
     def _compute_logits(self, prompt: str, injection_modulations: Optional[Dict[int, ModulationData]] = None,
                        injection_config: Optional[Dict[str, Any]] = None) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -896,6 +975,225 @@ class InteractiveKnowledgeTransfer:
                 reduction='sum'
             ).item()
             print(f"\n{Colors.BOLD}KL Divergence:{Colors.END} {kl_div:.6f}")
+
+    def _sample_token(self, probs: torch.Tensor, strategy: str = "greedy",
+                     temperature: float = 1.0, top_k: int = 50, top_p: float = 0.9) -> int:
+        """Sample next token from probability distribution."""
+        if strategy == "greedy":
+            return torch.argmax(probs).item()
+
+        # Apply temperature
+        if temperature != 1.0:
+            probs = torch.pow(probs, 1.0 / temperature)
+            probs = probs / probs.sum()
+
+        if strategy == "top_k":
+            # Keep only top k tokens
+            if top_k > 0:
+                values, indices = torch.topk(probs, min(top_k, len(probs)))
+                probs = torch.zeros_like(probs)
+                probs[indices] = values
+                probs = probs / probs.sum()
+
+        elif strategy == "top_p":
+            # Nucleus sampling
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cumsum = torch.cumsum(sorted_probs, dim=0)
+            mask = cumsum <= top_p
+            if mask.sum() == 0:
+                mask[0] = True
+            mask[mask.sum()] = True if mask.sum() < len(mask) else mask[-1]
+            probs = torch.zeros_like(probs)
+            probs[sorted_indices[mask]] = sorted_probs[mask]
+            probs = probs / probs.sum()
+
+        # Sample from distribution
+        return torch.multinomial(probs, 1).item()
+
+    def _generate_with_injection(self, name: str, initial_prompt: str, mode: str,
+                                num_tokens: int, injection_config: Dict[str, Any],
+                                sampling_strategy: str = "greedy",
+                                temperature: float = 1.0, top_k: int = 50, top_p: float = 0.9) -> List[str]:
+        """
+        Generate multiple tokens with continuous modulation injection.
+
+        At each step:
+        1. Inject modulation at last position
+        2. Generate next token
+        3. Append to prompt
+        4. Repeat
+        """
+        generated_tokens = []
+        current_prompt = initial_prompt
+        modulations = self.session.modulation_bank[name]
+
+        # Track metrics across generation
+        kl_divergences = []
+        tracked_probs_evolution = {token: [] for token in self.session.tracked_tokens}
+
+        print(f"\n{Colors.BOLD}Generating {num_tokens} tokens with '{name}' injection{Colors.END}")
+        print(f"Mode: {mode}")
+        if mode == 'blend':
+            print(f"Alpha: {injection_config.get('alpha', 1.0)}")
+        elif mode == 'add':
+            print(f"Strength: {injection_config.get('strength', 1.0)}")
+        print(f"Sampling: {sampling_strategy}")
+        if sampling_strategy != "greedy":
+            print(f"Temperature: {temperature}")
+        print(f"Initial: \"{Colors.CYAN}{initial_prompt}{Colors.END}\"")
+        print("\n" + "="*70)
+
+        for i in range(num_tokens):
+            # Compute with injection
+            logits, probs = self._compute_logits(
+                current_prompt,
+                modulations,
+                injection_config
+            )
+
+            # Compute baseline for comparison
+            baseline_logits, baseline_probs = self._compute_logits(
+                current_prompt,
+                None,
+                None
+            )
+
+            # Track KL divergence
+            kl_div = F.kl_div(
+                torch.log(probs + 1e-10),
+                baseline_probs,
+                reduction='sum'
+            ).item()
+            kl_divergences.append(kl_div)
+
+            # Track monitored tokens
+            for token, token_id in zip(self.session.tracked_tokens,
+                                      self.session.tracked_token_ids):
+                if token_id < len(probs):
+                    tracked_probs_evolution[token].append(probs[token_id].item())
+
+            # Sample next token
+            next_token_id = self._sample_token(
+                probs,
+                strategy=sampling_strategy,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p
+            )
+
+            next_token = self.tokenizer.decode([next_token_id])
+            generated_tokens.append(next_token)
+
+            # Display generation progress
+            baseline_prob = baseline_probs[next_token_id].item()
+            injected_prob = probs[next_token_id].item()
+            change = injected_prob - baseline_prob
+            percent_change = (change / (baseline_prob + 1e-10)) * 100
+
+            # Color based on probability shift
+            if percent_change > 50:
+                color = Colors.GREEN
+                arrow = "↑↑"
+            elif percent_change > 10:
+                color = Colors.GREEN
+                arrow = "↑"
+            elif percent_change < -50:
+                color = Colors.RED
+                arrow = "↓↓"
+            elif percent_change < -10:
+                color = Colors.RED
+                arrow = "↓"
+            else:
+                color = Colors.YELLOW
+                arrow = "→"
+
+            # Format token display (handle special characters and spaces)
+            token_display = repr(next_token) if '\n' in next_token or '\t' in next_token else next_token
+
+            print(f"Token {i+1:3}: {color}{token_display:15}{Colors.END} "
+                  f"[{baseline_prob:.3f} → {injected_prob:.3f}] "
+                  f"{arrow} ({percent_change:+.1f}%) "
+                  f"KL: {kl_div:.3f}")
+
+            # Update prompt
+            current_prompt += next_token
+
+            # Optional: Clear cache for long generations
+            if i % 10 == 0 and i > 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            # Check for EOS token
+            if next_token_id == self.tokenizer.eos_token_id:
+                print(f"{Colors.YELLOW}[EOS token generated - stopping]{Colors.END}")
+                break
+
+        # Display final generation
+        print("\n" + "="*70)
+        print(f"{Colors.BOLD}Complete generation:{Colors.END}")
+        generated_text = ''.join(generated_tokens)
+        print(f"\"{Colors.CYAN}{initial_prompt}{Colors.GREEN}{generated_text}{Colors.END}\"")
+
+        # Show tracking evolution if tokens were tracked
+        if self.session.tracked_tokens and any(len(v) > 0 for v in tracked_probs_evolution.values()):
+            self._display_tracking_evolution(tracked_probs_evolution)
+
+        # Show KL divergence trend
+        if kl_divergences:
+            print(f"\n{Colors.BOLD}KL Divergence Statistics:{Colors.END}")
+            print(f"  Mean: {np.mean(kl_divergences):.4f}")
+            print(f"  Max: {max(kl_divergences):.4f}")
+            print(f"  Min: {min(kl_divergences):.4f}")
+            print(f"  Final: {kl_divergences[-1]:.4f}")
+
+        return generated_tokens
+
+    def _display_tracking_evolution(self, tracked_probs_evolution: Dict[str, List[float]]):
+        """Display how tracked token probabilities evolved during generation."""
+        print(f"\n{Colors.BOLD}Tracked Token Evolution:{Colors.END}")
+
+        for token, probs_list in tracked_probs_evolution.items():
+            if not probs_list:
+                continue
+
+            # Format token for display
+            token_display = repr(token) if ' ' in token or token.startswith(' ') else token
+
+            print(f"\n  {Colors.CYAN}{token_display}:{Colors.END}")
+
+            # Calculate statistics
+            if len(probs_list) > 1:
+                initial = probs_list[0]
+                final = probs_list[-1]
+                change = final - initial
+                percent_change = (change / (initial + 1e-10)) * 100
+
+                # Show trend
+                if percent_change > 10:
+                    trend = f"{Colors.GREEN}↑ (+{percent_change:.1f}%){Colors.END}"
+                elif percent_change < -10:
+                    trend = f"{Colors.RED}↓ ({percent_change:.1f}%){Colors.END}"
+                else:
+                    trend = f"{Colors.YELLOW}→ ({percent_change:+.1f}%){Colors.END}"
+
+                print(f"    Initial: {initial:.4f} → Final: {final:.4f} {trend}")
+                print(f"    Max: {max(probs_list):.4f}, Min: {min(probs_list):.4f}")
+
+                # Show mini graph (text-based)
+                if len(probs_list) > 2:
+                    print(f"    Trend: ", end="")
+                    # Normalize to 0-10 scale for display
+                    min_p, max_p = min(probs_list), max(probs_list)
+                    range_p = max_p - min_p if max_p - min_p > 0 else 1
+
+                    for p in probs_list[:20]:  # Show first 20 tokens
+                        height = int((p - min_p) / range_p * 5)
+                        bars = "▁▂▃▄▅█"
+                        print(bars[min(height, 5)], end="")
+                    if len(probs_list) > 20:
+                        print("...", end="")
+                    print()
+            else:
+                print(f"    Probability: {probs_list[0]:.4f}")
 
     def cmd_compare(self, args: List[str]):
         """Compare baseline vs injection side by side."""
