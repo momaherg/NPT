@@ -1715,10 +1715,20 @@ def load_model_with_npt(checkpoint_path: str, model_name: str,
                 if any(f'.{i}' in k and ('W_down' in k or 'W_a_up' in k) for k in all_keys):
                     num_ranks = max(num_ranks, i + 1)
 
+            # Detect np_rank from checkpoint tensor shapes
+            np_rank = 256  # default
+            for key, value in state_dict.items():
+                if 'W_down_gate' in key or 'W_down_up' in key or 'W_down' in key:
+                    if isinstance(value, torch.Tensor) and value.dim() == 2:
+                        # Shape is [d_model, rank], so second dimension is the rank
+                        np_rank = value.shape[1]
+                        print(f"Detected np_rank={np_rank} from checkpoint")
+                        break
+
             # Create NPT config
             npt_config = NPTConfig(
                 layers_to_convert=layers_to_convert,
-                np_rank=256,
+                np_rank=np_rank,  # Use detected rank
                 np_init_scale=0.001,
                 single_layer_mode=False,
                 num_ranks=num_ranks,

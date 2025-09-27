@@ -12,21 +12,21 @@ echo "================================================================"
 python scripts/train_multi_layer_npt.py \
   --model_name "meta-llama/Llama-3.2-1B" \
   --model_size 1b \
-  --train_layers "6,7,8,9,10,11,12,13" \
+  --train_layers "12" \
   --curriculum_stages "teacher:45000" \
   --layer_weights "uniform" \
   --init_strategy improved \
   --triple_modulation \
-  --num_ranks 4 \
-  --np_rank 256 \
-  --np_init_scale 0.001 \
+  --num_ranks 8 \
+  --np_rank 512 \
+  --np_init_scale 0.0001 \
   --dataset_preset medium \
   --batch_size 64 \
   --gradient_accumulation_steps 1 \
   --max_length 32 \
-  --learning_rate 5e-5 \
+  --learning_rate 1e-5 \
   --weight_decay 0.01 \
-  --lambda_reg 0.01 \
+  --lambda_reg 0.1 \
   --direct_mlp_weight 10.0 \
   --fidelity_weight 1.0 \
   --gradient_scale_factor 1 \
@@ -37,13 +37,13 @@ python scripts/train_multi_layer_npt.py \
   --logging_steps 10 \
   --eval_steps 999999 \
   --num_eval_samples 1 \
-  --save_steps 2000 \
-  --generation_steps 500 \
+  --save_steps 2500 \
+  --generation_steps 1000 \
   --num_workers 1 \
   --wandb_project npt-multi-layer \
-  --wandb_name npt_dualscaffholding_attention_in_triple_modulation_15layers \
+  --wandb_name npt_dualscaffholding_triple_mod_12layerOnly \
   --wandb_tags llama-3.2 1b dual_modulation attention_in_modulation new_architecture 
-  # --resume_from "experiments/npt_attention_in_triple_modulation_15layers/checkpoints/checkpoint-30000/"
+  # --resume_from "experiments/npt_dualscaffholding_triple_mod_11layerOnly/checkpoints/checkpoint-22000/"
 
 # Key Changes from Previous Training:
 # =====================================
